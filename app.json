@@ -1,0 +1,48 @@
+{
+  "expo": {
+    "name": "ForBien",
+    "slug": "forbien",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#050B14"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.buzzlemax.forbien",
+      "infoPlist": {
+        "NSBluetoothAlwaysUsageDescription": "ForBien uses Bluetooth for offline mesh in Forest/Mission mode.",
+        "NSLocationWhenInUseUsageDescription": "ForBien needs location for mesh coordination and emergency routing."
+      }
+    },
+    "android": {
+      "package": "com.buzzlemax.forbien",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#050B14"
+      },
+      "permissions": [
+        "android.permission.BLUETOOTH",
+        "android.permission.BLUETOOTH_ADMIN",
+        "android.permission.BLUETOOTH_CONNECT",
+        "android.permission.BLUETOOTH_SCAN",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_WIFI_STATE",
+        "android.permission.CHANGE_WIFI_STATE"
+      ]
+    },
+    "plugins": [
+      "expo-asset"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "a006aa37-c87d-4526-b609-10172226882f"
+      }
+    }
+  }
+}

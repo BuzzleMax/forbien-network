@@ -1,0 +1,20 @@
+/** Premium Dark Theme — Pure Black + Neon Red for battery efficiency */
+export const colors = {
+  bgDeep: '#000000',
+  bgPanel: '#0A0A0A',
+  bgCard: '#111111',
+  cobalt: '#1E3A5F',
+  accent: '#2563EB',
+  accentMuted: '#3B82F6',
+  silver: '#E5E7EB',
+  silverDim: '#9CA3AF',
+  silverBlue: '#C7D2FE',
+  border: 'rgba(199, 210, 254, 0.18)',
+  emergency: '#FF0033',
+  emergencyGlow: '#FF3366',
+  neonRed: '#FF0033',
+  neonRedGlow: '#FF0044',
+  success: '#22C55E',
+  warning: '#FBBF24',
+  overlay: 'rgba(0, 0, 0, 0.95)',
+};
