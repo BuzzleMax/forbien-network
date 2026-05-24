@@ -43,8 +43,15 @@ async function requestAndroidBluetoothPermissions() {
 function isWifiNetwork(net) {
   if (!net) return false;
   const wifiEnum = Network.NetworkStateType?.WIFI;
+  
+  // Allow if type is WIFI (standard Wi-Fi connection)
   if (wifiEnum != null && net.type === wifiEnum) return true;
   if (net.type === 'WIFI') return true;
+  
+  // Allow if connected to any network (includes hotspot, local mesh, etc.)
+  // ForBien is built for local/mesh communication, so we don't require internet
+  if (net.isConnected === true) return true;
+  
   return false;
 }
 
@@ -182,18 +189,18 @@ export function SystemChecker({ onComplete }) {
     <View style={styles.screen}>
       <Text style={styles.head}>System check</Text>
       <Text style={styles.sub}>
-        Bluetooth, Wi‑Fi, and Location are required for Offline Mesh and emergency
+        Bluetooth, Network (Wi‑Fi/hotspot), and Location are required for Offline Mesh and emergency
         routing.
       </Text>
 
       <View style={styles.card}>
         <View style={styles.row}>
           <View style={styles.rowMain}>
-            <Text style={styles.rowTitle}>Wi‑Fi</Text>
-            <Text style={styles.rowHint}>Active Wi‑Fi connection (mesh readiness)</Text>
+            <Text style={styles.rowTitle}>Network</Text>
+            <Text style={styles.rowHint}>Wi‑Fi or hotspot (local mesh ready)</Text>
           </View>
           <Text style={[styles.badge, wifiOk ? styles.badgeOk : styles.badgeBad]}>
-            {wifiOk ? 'Ready' : 'Need Wi‑Fi'}
+            {wifiOk ? 'Ready' : 'Need Network'}
           </Text>
           {!wifiOk ? (
             <Pressable onPress={openSettings} style={styles.fix}>
