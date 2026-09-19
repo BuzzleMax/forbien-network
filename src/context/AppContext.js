@@ -3,108 +3,69 @@ import React, {
   useCallback,
   useContext,
   useEffect,
-  useRef,
   useMemo,
   useState,
 } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as mesh from '../api/meshLogic';
-import * as auth from '../services/auth';
-import { supabase } from '../lib/supabase';
 
 const SYSTEM_KEY = 'forbien_system_ok';
-const SYNC_THROTTLE_MS = 30000; // 30-second throttling for battery preservation
 
 const AppContext = createContext(null);
 
-const SEED_FRIENDS = [
-  { id: 'f1', name: 'Asha K.', handle: '@asha', online: true },
-  { id: 'f2', name: 'Ravi M.', handle: '@ravi', online: true },
-  { id: 'f3', name: 'Unit North', handle: '@unit_n', online: false },
-];
-
-const SEED_GROUPS = [
-  { id: 'g_patrol', name: 'Patrol Delta', members: 12 },
-  { id: 'g_ops', name: 'Ops Brief', members: 6 },
-];
-
 export function AppProvider({ children }) {
-  const [user, setUser] = useState(null);
-  const [profile, setProfile] = useState(null);
-  const [profileLoading, setProfileLoading] = useState(false);
   const [bootstrapDone, setBootstrapDone] = useState(false);
   const [systemCheckPassed, setSystemCheckPassed] = useState(false);
-  const [isMeshMode, setIsMeshMode] = useState(false);
+  const [isMeshMode, setIsMeshMode] = useState(true);
   const [missionGroupId, setMissionGroupId] = useState(null);
   const [emergencyPriority, setEmergencyPriority] = useState('auto');
   const [userRole, setUserRole] = useState('regular'); // 'regular', 'HQ', or 'Headquarters'
+  const [nodeRole, setNodeRoleState] = useState(mesh.NODE_ROLES?.FIELD || 'FIELD');
+  const [nodeId, setNodeId] = useState(mesh.getLocalNodeId?.() || 'NODE-LOCAL');
+  const [hqAlerts, setHqAlerts] = useState([]);
   const [hqClearanceLevel, setHqClearanceLevel] = useState('district'); // 'district', 'state', 'national'
   const [districtLog, setDistrictLog] = useState([]);
   const [stateLog, setStateLog] = useState([]);
   const [nationalLog, setNationalLog] = useState([]);
-  const [friends, setFriends] = useState(SEED_FRIENDS);
-  const [groups, setGroups] = useState(SEED_GROUPS);
-  const authSubscriptionRef = useRef(null);
-  const lastSupabaseSyncRef = useRef(0);
+  const [peripheralSupported, setPeripheralSupported] = useState(null); // null = unknown, true/false
 
   const refreshBootstrap = useCallback(async () => {
-    const [session, sys] = await Promise.all([
-      auth.getSession(),
-      AsyncStorage.getItem(SYSTEM_KEY),
-    ]);
-    setUser(session);
+    const sys = await AsyncStorage.getItem(SYSTEM_KEY);
     setSystemCheckPassed(sys === 'true');
     setBootstrapDone(true);
   }, []);
 
-  const refreshProfile = useCallback(async (uid) => {
-    if (!uid) {
-      setProfile(null);
-      return;
-    }
-
-    // Check if we should throttle this sync (30-second interval)
-    const now = Date.now();
-    const timeSinceLastSync = now - lastSupabaseSyncRef.current;
-    if (timeSinceLastSync < SYNC_THROTTLE_MS) {
-      console.log(`Supabase sync throttled: ${timeSinceLastSync}ms since last sync (minimum ${SYNC_THROTTLE_MS}ms)`);
-      return;
-    }
-
-    setProfileLoading(true);
-    const res = await auth.fetchProfile(uid);
-    if (res.ok) setProfile(res.profile);
-    else setProfile(null);
-    setProfileLoading(false);
-    lastSupabaseSyncRef.current = Date.now();
-  }, []);
-
   useEffect(() => {
     refreshBootstrap();
-  }, [refreshBootstrap]);
-
-  useEffect(() => {
-    let mounted = true;
-    const bootstrapAuth = async () => {
-      const initialUser = await auth.getSession();
-      if (!mounted) return;
-      setUser(initialUser);
-      await refreshProfile(initialUser?.id);
-      if (mounted) setBootstrapDone(true);
-    };
-    bootstrapAuth();
-    const { data } = supabase.auth.onAuthStateChange((_event, session) => {
-      const nextUser = session?.user || null;
-      setUser(nextUser);
-      refreshProfile(nextUser?.id);
+    mesh.loadNodeIdentity().then((id) => {
+      setNodeId(id);
+      setNodeRoleState(mesh.getNodeRole());
     });
-    authSubscriptionRef.current = data.subscription;
-    return () => {
-      mounted = false;
-      authSubscriptionRef.current?.unsubscribe();
-      authSubscriptionRef.current = null;
-    };
-  }, [refreshProfile]);
+
+    // Check peripheral support on app startup
+    mesh.checkPeripheralSupport().then((supported) => {
+      setPeripheralSupported(supported);
+    });
+
+    const unsub = mesh.onPeerEvent((event, payload) => {
+      if (event === 'hq_delivery') {
+        setHqAlerts((prev) => {
+          if (prev.some((a) => a.id === payload.id)) return prev;
+          return [payload, ...prev];
+        });
+      } else if (event === 'role_changed') {
+        setNodeRoleState(payload.role);
+        setNodeId(payload.nodeId);
+      } else if (event === 'mesh_state') {
+        // Update peripheral support from mesh state events
+        if (payload.peripheralSupported !== undefined) {
+          setPeripheralSupported(payload.peripheralSupported);
+        }
+      }
+    });
+
+    return unsub;
+  }, [refreshBootstrap]);
 
   useEffect(() => {
     let mounted = true;
@@ -121,23 +82,21 @@ export function AppProvider({ children }) {
     };
   }, [isMeshMode]);
 
+  const updateNodeRole = useCallback(async (newRole) => {
+    const res = await mesh.setNodeRole(newRole);
+    if (res.ok) {
+      setNodeRoleState(res.role);
+      setNodeId(res.nodeId);
+    }
+  }, []);
+
   const completeSystemCheck = useCallback(async () => {
     await AsyncStorage.setItem(SYSTEM_KEY, 'true');
     setSystemCheckPassed(true);
   }, []);
 
-  const signOut = useCallback(async () => {
-    await auth.signOut();
-    setProfile(null);
-    setUser(null);
-  }, []);
-
-  const setSessionUser = useCallback((u) => setUser(u), []);
-
   const createGroup = useCallback((name) => {
-    const id = `g_${Date.now()}`;
-    setGroups((g) => [...g, { id, name, members: 1 }]);
-    return id;
+    return `m_${Date.now()}`;
   }, []);
 
   /**
@@ -150,7 +109,7 @@ export function AppProvider({ children }) {
       ...packet,
       loggedAt: Date.now(),
       packetLevel,
-      loggedBy: user?.id || 'unknown',
+      loggedBy: 'device_local',
     };
 
     // Always log to district level (lowest tier)
@@ -167,7 +126,7 @@ export function AppProvider({ children }) {
     if (hqClearanceLevel === 'national') {
       setNationalLog((prev) => [...prev, logEntry]);
     }
-  }, [hqClearanceLevel, user?.id]);
+  }, [hqClearanceLevel]);
 
   /**
    * Clear logs for a specific tier
@@ -208,11 +167,6 @@ export function AppProvider({ children }) {
   const value = useMemo(
     () => ({
       bootstrapDone,
-      user,
-      profile,
-      profileLoading,
-      setSessionUser,
-      signOut,
       systemCheckPassed,
       completeSystemCheck,
       isMeshMode,
@@ -223,6 +177,11 @@ export function AppProvider({ children }) {
       setEmergencyPriority,
       userRole,
       setUserRole,
+      nodeRole,
+      setNodeRole: updateNodeRole,
+      nodeId,
+      hqAlerts,
+      setHqAlerts,
       hqClearanceLevel,
       setHqClearanceLevel,
       districtLog,
@@ -231,25 +190,22 @@ export function AppProvider({ children }) {
       logTacticalPacket,
       clearLogs,
       getAccessibleLogs,
-      friends,
-      setFriends,
-      groups,
       createGroup,
       refreshBootstrap,
+      peripheralSupported,
     }),
     [
       bootstrapDone,
-      user,
-      profile,
-      profileLoading,
-      setSessionUser,
-      signOut,
       systemCheckPassed,
       completeSystemCheck,
       isMeshMode,
       missionGroupId,
       emergencyPriority,
       userRole,
+      nodeRole,
+      updateNodeRole,
+      nodeId,
+      hqAlerts,
       hqClearanceLevel,
       districtLog,
       stateLog,
@@ -257,10 +213,9 @@ export function AppProvider({ children }) {
       logTacticalPacket,
       clearLogs,
       getAccessibleLogs,
-      friends,
-      groups,
       createGroup,
       refreshBootstrap,
+      peripheralSupported,
     ],
   );
 

@@ -1,30 +1,15 @@
-import React, { useEffect, useState } from 'react';
+import React from 'react';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { StyleSheet, View } from 'react-native';
-import * as Network from 'expo-network';
 import { HomeScreen } from '../screens/HomeScreen';
-import { SocialHub } from '../screens/SocialHub';
 import { OfflineMeshChat } from '../screens/OfflineMeshChat';
+import { ChatScreen } from '../screens/ChatScreen';
 import { BuzzleFooter } from '../components/BuzzleFooter';
 import { colors } from '../theme/colors';
 
 const Tab = createBottomTabNavigator();
 
 export function MainTabs() {
-  const [isConnected, setIsConnected] = useState(true);
-
-  useEffect(() => {
-    const checkConnection = async () => {
-      const networkState = await Network.getNetworkStateAsync();
-      setIsConnected(networkState.isConnected);
-    };
-
-    checkConnection();
-    const interval = setInterval(checkConnection, 5000);
-
-    return () => clearInterval(interval);
-  }, []);
-
   return (
     <View style={styles.wrap}>
       <Tab.Navigator
@@ -48,17 +33,14 @@ export function MainTabs() {
           options={{ tabBarLabel: 'Tactical SOS' }}
         />
         <Tab.Screen
-          name="SocialHub"
-          component={SocialHub}
-          options={{ tabBarLabel: 'Social Hub' }}
-        />
-        <Tab.Screen
           name="OfflineMeshChat"
           component={OfflineMeshChat}
-          options={{
-            tabBarLabel: 'Offline Mesh',
-            tabBarItemStyle: isConnected ? { display: 'none' } : undefined,
-          }}
+          options={{ tabBarLabel: 'Offline Mesh' }}
+        />
+        <Tab.Screen
+          name="Chat"
+          component={ChatScreen}
+          options={{ tabBarLabel: 'Offline Messages' }}
         />
       </Tab.Navigator>
       <BuzzleFooter />

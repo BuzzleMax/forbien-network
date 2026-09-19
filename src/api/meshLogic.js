@@ -5,6 +5,39 @@
  * and delivery state tracking over physical Bluetooth Low Energy.
  */
 
+
+let PermissionsAndroid = null;
+let Platform = { OS: 'node', Version: 0 };
+try {
+  const RN = require('react-native');
+  PermissionsAndroid = RN.PermissionsAndroid;
+  Platform = RN.Platform;
+} catch (e) {
+  // Running in Node / unit test environment
+}
+
+async function requestBLEPermissions() {
+  if (Platform.OS === 'android') {
+    if (Platform.Version >= 31) {
+      const res = await PermissionsAndroid.requestMultiple([
+        PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
+        PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
+        PermissionsAndroid.PERMISSIONS.BLUETOOTH_ADVERTISE,
+        PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+      ]);
+      return res[PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN] === PermissionsAndroid.RESULTS.GRANTED &&
+             res[PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT] === PermissionsAndroid.RESULTS.GRANTED &&
+             res[PermissionsAndroid.PERMISSIONS.BLUETOOTH_ADVERTISE] === PermissionsAndroid.RESULTS.GRANTED;
+    } else {
+      const res = await PermissionsAndroid.requestMultiple([
+        PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+      ]);
+      return res[PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION] === PermissionsAndroid.RESULTS.GRANTED;
+    }
+  }
+  return true;
+}
+
 let BleManager = null;
 try {
   BleManager = require('react-native-ble-plx').BleManager;
@@ -58,6 +91,7 @@ import * as blePeripheral from './blePeripheralNative.js';
 const listeners = new Set();
 let meshEnabled = false;
 let bleManager = null;
+let peripheralSupported = null; // null = not checked yet, true/false = result
 
 /** @type {Map<string, {id: string, name?: string, rssi?: number, device?: any}>} */
 const peers = new Map();
@@ -505,6 +539,12 @@ function initBleManager() {
  * Start BLE scanning to discover nearby ForBien devices
  */
 export async function startScan() {
+  const hasPerms = await requestBLEPermissions();
+  if (!hasPerms) {
+    emit('scan_error', { error: 'Missing BLE permissions' });
+    return { ok: false, error: 'Missing BLE permissions' };
+  }
+  
   const manager = initBleManager();
   
   try {
@@ -515,7 +555,7 @@ export async function startScan() {
 
     const scanOptions = { allowDuplicates: true, scanMode: 2 }; // ScanMode.LowLatency
     
-    // First scan with service filter, or fallback to scanning null to catch devices whose adv payload doesn't fit UUID
+    // Unfiltered scan to catch devices whose adv payload doesn't fit UUID perfectly
     manager.startDeviceScan(null, scanOptions, (error, device) => {
       if (error) {
         console.error('Scan error:', error);
@@ -555,6 +595,9 @@ export async function startScan() {
           
           // Trigger queue processing when new peer discovered
           processOutboundQueue();
+          
+          // Automatically connect to the peer
+          connectToPeer(device.id);
         }
         }
       }
@@ -566,6 +609,8 @@ export async function startScan() {
     return { ok: false, error: error.message };
   }
 }
+
+
 
 /**
  * Stop BLE scanning
@@ -585,6 +630,11 @@ export async function stopScan() {
  * Start broadcasting/advertising GATT Server to make device discoverable
  */
 export async function startBroadcast() {
+  // Check if peripheral mode is supported
+  if (peripheralSupported === false) {
+    return { ok: false, peripheralUnsupported: true, error: 'BLE Peripheral mode not supported on this device' };
+  }
+
   const now = Date.now();
   const timeSinceLastAdvertising = now - lastAdvertisingTime;
   if (timeSinceLastAdvertising < ADVERTISING_THROTTLE_MS && lastAdvertisingTime !== 0) {
@@ -971,6 +1021,9 @@ export async function enableMesh() {
       return { ok: false, error: 'Bluetooth not powered on' };
     }
 
+    // Check peripheral support before starting mesh
+    await checkPeripheralSupport();
+
     meshEnabled = true;
 
     // Attach native GATT write listener for inbound BLE packets
@@ -989,18 +1042,24 @@ export async function enableMesh() {
       });
     }
 
-    const [scanResult, broadcastResult] = await Promise.all([
-      startScan(),
-      startBroadcast(),
-    ]);
+    // Start scanning (central mode) - this works regardless of peripheral support
+    const scanResult = await startScan();
 
     if (!scanResult.ok) {
       meshEnabled = false;
       return { ok: false, error: `Scan failed: ${scanResult.error}` };
     }
 
-    emit('mesh_state', { enabled: true, peers: peers.size });
-    return { ok: true, peers: Array.from(peers.values()) };
+    // Only start broadcast/advertising if peripheral mode is supported
+    let broadcastResult = { ok: false, peripheralUnsupported: true };
+    if (peripheralSupported) {
+      broadcastResult = await startBroadcast();
+    } else {
+      console.warn('[Mesh] BLE Peripheral mode not supported on this device - operating in scan-only mode');
+    }
+
+    emit('mesh_state', { enabled: true, peers: peers.size, peripheralSupported });
+    return { ok: true, peers: Array.from(peers.values()), peripheralSupported };
   } catch (error) {
     console.error('Failed to enable mesh:', error);
     meshEnabled = false;
@@ -1051,7 +1110,20 @@ export function getMeshStatus() {
     persistentMessages: persistentMessageQueue.size,
     processedDuplicatesCount: processedMessageIds.size,
     authorizedHQs: Array.from(AUTHORIZED_HQ_UUIDS),
+    peripheralSupported,
   };
+}
+
+/**
+ * Check if BLE peripheral mode is supported on this device
+ * @returns {Promise<boolean>}
+ */
+export async function checkPeripheralSupport() {
+  if (peripheralSupported !== null) {
+    return peripheralSupported;
+  }
+  peripheralSupported = await blePeripheral.isPeripheralSupported();
+  return peripheralSupported;
 }
 
 /**
@@ -1454,66 +1526,42 @@ export function onPeerEvent(cb) {
  * MUST NOT be invoked by real BLE runtime paths.
  */
 export async function simulateIncomingPeerMessage(groupId, text, hopCount = 0, encrypted = false, isHQNode = false, payload = null) {
-  console.log('[DEVELOPMENT / DEMO ONLY] Invoking simulateIncomingPeerMessage');
-  let rawPacket = payload || text;
-  let decryptedData = null;
-  let isEncrypted = encrypted || (rawPacket && (rawPacket.algo === 'AES-256-GCM' || rawPacket.v === 2 || isLegacyXORPacket(rawPacket)));
-  
-  if (isEncrypted && meshEnabled) {
+  if (process.env.NODE_ENV !== 'test') {
+    console.warn('[PRODUCTION] simulateIncomingPeerMessage is disabled in production to enforce physical BLE data path.');
+    return { ok: false, error: 'Simulation disabled' };
+  }
+  // ---- TEST ENVIRONMENT ONLY ----
+  // Pre-validate encryption / legacy before handing to processIncomingPacket
+  // so test assertions about tampered/legacy flags work correctly.
+  const rawPacket = payload || text;
+  const isEncrypted = encrypted ||
+    (rawPacket && (rawPacket.algo === 'AES-256-GCM' || rawPacket.v === 2 || isLegacyXORPacket(rawPacket)));
+
+  if (isLegacyXORPacket(rawPacket)) {
+    // Replicate the legacy drop path
+    return handleLegacyXORPacket(rawPacket);
+  }
+
+  if (isEncrypted) {
     const decryptRes = await decryptPayloadAESGCM(rawPacket, currentMeshSecret);
-    if (decryptRes.legacy) {
-      return { ok: false, legacy: true, error: 'Legacy XOR packet dropped' };
-    }
-    if (!decryptRes.ok) {
-      return { ok: false, tampered: true, error: decryptRes.error };
-    }
-    decryptedData = decryptRes.data;
-  } else {
-    decryptedData = typeof rawPacket === 'object' ? rawPacket : { text: String(rawPacket) };
+    if (decryptRes.legacy) return { ok: false, legacy: true, error: 'Legacy XOR packet dropped' };
+    if (!decryptRes.ok)   return { ok: false, tampered: true, error: decryptRes.error };
   }
 
-  let processedText = decryptedData.text || (typeof decryptedData === 'string' ? decryptedData : text);
-  let processedPayload = typeof decryptedData === 'object' ? decryptedData : {};
-  
-  if (isHQNode && processedPayload.compressed) {
-    try {
-      const decompressedData = decompressSOSData(processedPayload.compressed);
-      processedText = decompressedData.message || processedText;
-      processedPayload = {
-        ...processedPayload,
-        ...decompressedData,
-        decompressed: true,
-      };
-    } catch (error) {
-      console.error('SOS decompression error:', error);
-    }
-  }
-
-  const messageId = rawPacket?.id || `rx_sim_${Date.now()}`;
-
-  // Run duplicate check
-  if (isDuplicateMessage(messageId)) {
-    return { ok: false, duplicate: true, error: 'Duplicate message dropped' };
-  }
-
-  const message = {
-    id: messageId,
-    groupId, 
-    text: processedText, 
-    ts: Date.now(), 
-    from: 'simulated_peer', 
-    hopCount,
+  // Build a minimal packet envelope so processIncomingPacket can route it
+  const msgId = rawPacket?.id || `rx_sim_${Date.now()}`;
+  const envelope = {
+    id: msgId,
+    groupId,
+    text,
+    hopCount: hopCount + 1,
     maxHops: 5,
-    encrypted: true,
-    algo: 'AES-256-GCM',
-    compressed: processedPayload.compressed || false,
-    decompressed: processedPayload.decompressed || false,
-    type: processedPayload.type || 'regular',
-    deliveryState: DELIVERY_STATES.RECEIVED,
-    meta: processedPayload,
+    sourceNodeId: isHQNode ? HQ_NODE_ID : `NODE-SIM`,
+    destinationNodeId: getLocalNodeId(),
+    type: 'SOS',
+    encrypted: isEncrypted,
+    payload: rawPacket,
   };
-
-  storeMessagePersistent(message);
-  emit('message', message);
-  return { ok: true, message };
+  return await processIncomingPacket(envelope, 'test_peer');
 }
+

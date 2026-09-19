@@ -4,19 +4,34 @@
   "main": "node_modules/expo/AppEntry.js",
   "scripts": {
     "start": "expo start",
+    "dev": "expo start",
     "android": "expo run:android",
     "ios": "expo run:ios",
-    "web": "expo start --web"
+    "web": "expo start --web",
+    "dev:hq": "npm --prefix forbien-hq-web run dev",
+    "build:hq": "npm --prefix forbien-hq-web run build",
+    "dev:web": "npx -y serve forbien-web -l 3000",
+    "dev:website": "npx -y serve forbien-web -l 3000",
+    "web:landing": "npx -y serve forbien-web -l 3000",
+    "test:hq": "node src/lib/test-hq-functionality.js",
+    "test:ble": "node src/lib/test-ble-protocol.js",
+    "test:crypto": "node src/lib/test-crypto-suite.js",
+    "test:physical": "node src/lib/test-hq-physical.js",
+    "test:auth": "node src/lib/test-hq-authentication.js",
+    "test:all": "npm run test:auth && npm run test:hq && npm run test:ble && npm run test:crypto && npm run test:physical"
   },
   "dependencies": {
-    "@react-native-async-storage/async-storage": "2.2.0",
+    "@noble/ed25519": "^2.2.3",
+    "@noble/hashes": "^2.4.0",
+    "@react-native-async-storage/async-storage": "~2.2.0",
     "@react-navigation/bottom-tabs": "^7.2.0",
     "@react-navigation/native": "^7.0.14",
     "@react-navigation/native-stack": "^7.2.0",
-    "@supabase/supabase-js": "^2.105.4",
-    "expo": "^54.0.0",
+    "expo": "~54.0.35",
     "expo-asset": "~12.0.13",
     "expo-av": "^16.0.8",
+    "expo-build-properties": "~1.0.10",
+    "expo-image-picker": "~17.0.11",
     "expo-linking": "~8.0.12",
     "expo-location": "~19.0.8",
     "expo-network": "~8.0.8",
@@ -29,7 +44,8 @@
   },
   "devDependencies": {
     "@babel/core": "^7.25.2",
-    "babel-preset-expo": "~54.0.10"
+    "babel-preset-expo": "~54.0.10",
+    "eas-cli": "^23.2.0"
   },
   "private": true
 }

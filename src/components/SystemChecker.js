@@ -183,30 +183,25 @@ export function SystemChecker({ onComplete }) {
   const openSettings = () => Linking.openSettings();
 
   const bluetoothGatePassed = isSimulated ? true : btOk;
-  const allReady = wifiOk && locOk && bluetoothGatePassed;
+  const allReady = locOk && bluetoothGatePassed;
 
   return (
     <View style={styles.screen}>
       <Text style={styles.head}>System check</Text>
       <Text style={styles.sub}>
-        Bluetooth, Network (Wi‑Fi/hotspot), and Location are required for Offline Mesh and emergency
+        Bluetooth and Location (GPS) are required for Offline Mesh peer discovery and emergency
         routing.
       </Text>
 
       <View style={styles.card}>
         <View style={styles.row}>
           <View style={styles.rowMain}>
-            <Text style={styles.rowTitle}>Network</Text>
-            <Text style={styles.rowHint}>Wi‑Fi or hotspot (local mesh ready)</Text>
+            <Text style={styles.rowTitle}>Offline Mesh Engine</Text>
+            <Text style={styles.rowHint}>Pure Offline BLE (No Internet Required)</Text>
           </View>
-          <Text style={[styles.badge, wifiOk ? styles.badgeOk : styles.badgeBad]}>
-            {wifiOk ? 'Ready' : 'Need Network'}
+          <Text style={[styles.badge, styles.badgeOk]}>
+            Offline Ready
           </Text>
-          {!wifiOk ? (
-            <Pressable onPress={openSettings} style={styles.fix}>
-              <Text style={styles.fixText}>Settings</Text>
-            </Pressable>
-          ) : null}
         </View>
 
         <View style={styles.row}>

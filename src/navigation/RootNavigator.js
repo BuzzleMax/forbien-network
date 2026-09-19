@@ -4,12 +4,11 @@ import { NavigationContainer, DefaultTheme } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { useApp } from '../context/AppContext';
 import { colors } from '../theme/colors';
-import { LoginScreen } from '../screens/LoginScreen';
-import { SignUpScreen } from '../screens/SignUpScreen';
-import { ReclaimScreen } from '../screens/ReclaimScreen';
 import { SystemGateScreen } from '../screens/SystemGateScreen';
 import { MainTabs } from './MainTabs';
 import { EmergencyHQ } from '../screens/EmergencyHQ';
+import { EmergencyMessageScreen } from '../screens/EmergencyMessageScreen';
+import { EmergencyHistoryScreen } from '../screens/EmergencyHistoryScreen';
 
 const Stack = createNativeStackNavigator();
 
@@ -26,7 +25,7 @@ const navTheme = {
 };
 
 export function RootNavigator() {
-  const { bootstrapDone, user, systemCheckPassed } = useApp();
+  const { bootstrapDone, systemCheckPassed } = useApp();
 
   if (!bootstrapDone) {
     return (
@@ -39,17 +38,21 @@ export function RootNavigator() {
   return (
     <NavigationContainer theme={navTheme}>
       <Stack.Navigator screenOptions={{ headerShown: false }}>
-        {!user ? (
-          <>
-            <Stack.Screen name="Login" component={LoginScreen} />
-            <Stack.Screen name="SignUp" component={SignUpScreen} />
-            <Stack.Screen name="Reclaim" component={ReclaimScreen} />
-          </>
-        ) : !systemCheckPassed ? (
+        {!systemCheckPassed ? (
           <Stack.Screen name="SystemGate" component={SystemGateScreen} />
         ) : (
           <>
             <Stack.Screen name="Main" component={MainTabs} />
+            <Stack.Screen
+              name="EmergencyMessage"
+              component={EmergencyMessageScreen}
+              options={{ presentation: 'fullScreenModal' }}
+            />
+            <Stack.Screen
+              name="EmergencyHistory"
+              component={EmergencyHistoryScreen}
+              options={{ presentation: 'card' }}
+            />
             <Stack.Screen
               name="EmergencyHQ"
               component={EmergencyHQ}
