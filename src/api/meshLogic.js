@@ -93,6 +93,32 @@ let meshEnabled = false;
 let bleManager = null;
 let peripheralSupported = null; // null = not checked yet, true/false = result
 
+/** @type {Set<string>} - Peer IDs currently in middle of GATT connection attempt */
+const connectingPeers = new Set();
+
+/** @type {Map<string, any>} - Active connected BLE devices: peerId -> connectedDevice */
+const activeConnections = new Map();
+
+/**
+ * Timeout helper for BLE operations
+ */
+function withTimeout(promise, timeoutMs, timeoutMsg = 'Operation timed out') {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(timeoutMsg));
+    }, timeoutMs);
+    promise
+      .then((res) => {
+        clearTimeout(timer);
+        resolve(res);
+      })
+      .catch((err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+  });
+}
+
 /** @type {Map<string, {id: string, name?: string, rssi?: number, device?: any}>} */
 const peers = new Map();
 const outboundQueue = [];
@@ -595,9 +621,6 @@ export async function startScan() {
           
           // Trigger queue processing when new peer discovered
           processOutboundQueue();
-          
-          // Automatically connect to the peer
-          connectToPeer(device.id);
         }
         }
       }
@@ -952,10 +975,13 @@ export async function processOutboundQueue() {
         if (!peer.device) continue;
 
         try {
-          console.log(`[BLE Transport] Connecting to peer ${peer.id}...`);
-          const device = peer.device;
-          const connectedDevice = await device.connect();
-          await connectedDevice.discoverAllServicesAndCharacteristics();
+          const connRes = await connectToPeer(peer.id);
+          if (!connRes.ok || !connRes.device) {
+            console.warn(`[BLE Transport] Skipping peer ${peer.id}: ${connRes.error}`);
+            continue;
+          }
+
+          const connectedDevice = connRes.device;
 
           packet.deliveryState = DELIVERY_STATES.TRANSMITTING;
           emit('delivery_state_change', { packetId: packet.id, state: DELIVERY_STATES.TRANSMITTING });
@@ -972,11 +998,15 @@ export async function processOutboundQueue() {
               base64Payload = Buffer.from(frag, 'utf-8').toString('base64');
             }
 
-            // Execute real physical write operation
-            await connectedDevice.writeCharacteristicWithResponseForService(
-              MESH_SERVICE_UUID,
-              MESH_CHARACTERISTIC_UUID,
-              base64Payload
+            // Execute real physical write operation with 5s timeout
+            await withTimeout(
+              connectedDevice.writeCharacteristicWithResponseForService(
+                MESH_SERVICE_UUID,
+                MESH_CHARACTERISTIC_UUID,
+                base64Payload
+              ),
+              5000,
+              `Write timeout to peer ${peer.id}`
             );
           }
 
@@ -987,7 +1017,7 @@ export async function processOutboundQueue() {
 
         } catch (writeErr) {
           console.warn(`[BLE Write Error] Failed write to peer ${peer.id}:`, writeErr.message);
-          // STEP 9: CONNECTION FAILURE RECOVERY - Packet stays queued locally for another attempt
+          activeConnections.delete(peer.id);
         }
       }
 
@@ -996,9 +1026,20 @@ export async function processOutboundQueue() {
         outboundQueue.shift();
         await saveQueuesToStorage();
       } else {
-        // Could not transmit to any peer, pause worker loop and keep in QUEUED state
-        packet.deliveryState = DELIVERY_STATES.FAILED;
-        emit('delivery_state_change', { packetId: packet.id, state: DELIVERY_STATES.FAILED });
+        // Could not transmit to any peer in this pass
+        packet._attempts = (packet._attempts || 0) + 1;
+        if (packet._attempts >= 3) {
+          console.warn(`[Outbound Queue] Packet ${packet.id} failed after ${packet._attempts} attempts. Rotating to back of queue.`);
+          packet._attempts = 0;
+          const failedPacket = outboundQueue.shift();
+          failedPacket.deliveryState = DELIVERY_STATES.FAILED;
+          emit('delivery_state_change', { packetId: failedPacket.id, state: DELIVERY_STATES.FAILED });
+          outboundQueue.push(failedPacket);
+          await saveQueuesToStorage();
+        } else {
+          packet.deliveryState = DELIVERY_STATES.QUEUED;
+          emit('delivery_state_change', { packetId: packet.id, state: DELIVERY_STATES.QUEUED });
+        }
         break;
       }
     }
@@ -1207,15 +1248,48 @@ export async function connectToPeer(peerId) {
     return { ok: false, error: 'Peer not found' };
   }
 
+  // If already connected and active, reuse connection
+  if (activeConnections.has(peerId)) {
+    const existing = activeConnections.get(peerId);
+    try {
+      const isConn = await existing.isConnected();
+      if (isConn) {
+        return { ok: true, device: existing };
+      }
+    } catch {
+      activeConnections.delete(peerId);
+    }
+  }
+
+  // Prevent concurrent connection attempts to the same peer
+  if (connectingPeers.has(peerId)) {
+    return { ok: false, error: 'Connection attempt already in progress' };
+  }
+
+  connectingPeers.add(peerId);
+
   try {
     const device = peer.device;
-    const connected = await device.connect();
-    await connected.discoverAllServicesAndCharacteristics();
+    console.log(`[BLE Transport] Attempting connection to peer ${peerId}...`);
+    const connected = await withTimeout(device.connect(), 8000, `Connection timeout to peer ${peerId}`);
+    await withTimeout(connected.discoverAllServicesAndCharacteristics(), 8000, `Service discovery timeout for peer ${peerId}`);
+    
+    activeConnections.set(peerId, connected);
+    connectingPeers.delete(peerId);
     
     emit('peer_connected', { peerId });
     return { ok: true, device: connected };
   } catch (error) {
-    console.error('Failed to connect to peer:', error);
+    connectingPeers.delete(peerId);
+    activeConnections.delete(peerId);
+    console.warn(`[BLE Transport] Failed connection to peer ${peerId}:`, error.message);
+    try {
+      if (peer.device && typeof peer.device.cancelConnection === 'function') {
+        await peer.device.cancelConnection().catch(() => {});
+      }
+    } catch {
+      /* ignore */
+    }
     return { ok: false, error: error.message };
   }
 }
@@ -1225,13 +1299,19 @@ export async function connectToPeer(peerId) {
  * @param {string} peerId
  */
 export async function disconnectFromPeer(peerId) {
+  connectingPeers.delete(peerId);
+  const activeDev = activeConnections.get(peerId);
+  activeConnections.delete(peerId);
+
   const peer = peers.get(peerId);
-  if (!peer || !peer.device) {
+  const device = activeDev || (peer ? peer.device : null);
+
+  if (!device) {
     return { ok: false, error: 'Peer not found' };
   }
 
   try {
-    await peer.device.cancelConnection();
+    await device.cancelConnection();
     emit('peer_disconnected', { peerId });
     return { ok: true };
   } catch (error) {
@@ -1526,9 +1606,9 @@ export function onPeerEvent(cb) {
  * MUST NOT be invoked by real BLE runtime paths.
  */
 export async function simulateIncomingPeerMessage(groupId, text, hopCount = 0, encrypted = false, isHQNode = false, payload = null) {
-  if (process.env.NODE_ENV !== 'test') {
-    console.warn('[PRODUCTION] simulateIncomingPeerMessage is disabled in production to enforce physical BLE data path.');
-    return { ok: false, error: 'Simulation disabled' };
+  if (process.env.NODE_ENV !== 'test' && Platform.OS !== 'node') {
+    console.warn('[PRODUCTION] simulateIncomingPeerMessage is disabled on physical Android production devices to enforce physical BLE data path.');
+    return { ok: false, error: 'Simulation disabled on physical device' };
   }
   // ---- TEST ENVIRONMENT ONLY ----
   // Pre-validate encryption / legacy before handing to processIncomingPacket

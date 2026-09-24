@@ -26,15 +26,21 @@ async function requestAndroidBluetoothPermissions() {
       const res = await PermissionsAndroid.requestMultiple([
         PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
         PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
+        PermissionsAndroid.PERMISSIONS.BLUETOOTH_ADVERTISE,
+        PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
       ]);
       return (
-        res['android.permission.BLUETOOTH_CONNECT'] ===
-          PermissionsAndroid.RESULTS.GRANTED &&
-        res['android.permission.BLUETOOTH_SCAN'] ===
-          PermissionsAndroid.RESULTS.GRANTED
+        res['android.permission.BLUETOOTH_CONNECT'] === PermissionsAndroid.RESULTS.GRANTED &&
+        res['android.permission.BLUETOOTH_SCAN'] === PermissionsAndroid.RESULTS.GRANTED &&
+        res['android.permission.BLUETOOTH_ADVERTISE'] === PermissionsAndroid.RESULTS.GRANTED &&
+        res['android.permission.ACCESS_FINE_LOCATION'] === PermissionsAndroid.RESULTS.GRANTED
       );
+    } else {
+      const res = await PermissionsAndroid.requestMultiple([
+        PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+      ]);
+      return res['android.permission.ACCESS_FINE_LOCATION'] === PermissionsAndroid.RESULTS.GRANTED;
     }
-    return true;
   } catch {
     return false;
   }

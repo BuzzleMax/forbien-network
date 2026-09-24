@@ -171,8 +171,11 @@ public class BleGattServerModule extends ReactContextBaseJavaModule {
             ParcelUuid pUuid = new ParcelUuid(UUID.fromString(SERVICE_UUID));
 
             AdvertiseData data = new AdvertiseData.Builder()
-                    .setIncludeDeviceName(true)
                     .addServiceUuid(pUuid)
+                    .build();
+
+            AdvertiseData scanResponse = new AdvertiseData.Builder()
+                    .setIncludeDeviceName(true)
                     .build();
 
             if (advertiseCallback != null) {
@@ -207,7 +210,7 @@ public class BleGattServerModule extends ReactContextBaseJavaModule {
                 }
             }
 
-            advertiser.startAdvertising(settings, data, advertiseCallback);
+            advertiser.startAdvertising(settings, data, scanResponse, advertiseCallback);
             promise.resolve(true);
         } catch (Exception e) {
             Log.e(TAG, "Failed to start BLE advertising", e);

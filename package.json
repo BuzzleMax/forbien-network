@@ -18,7 +18,8 @@
     "test:crypto": "node src/lib/test-crypto-suite.js",
     "test:physical": "node src/lib/test-hq-physical.js",
     "test:auth": "node src/lib/test-hq-authentication.js",
-    "test:all": "npm run test:auth && npm run test:hq && npm run test:ble && npm run test:crypto && npm run test:physical"
+    "test:mtu": "node src/lib/test-mtu-fragmentation.js",
+    "test:all": "npm run test:auth && npm run test:hq && npm run test:ble && npm run test:crypto && npm run test:physical && npm run test:mtu"
   },
   "dependencies": {
     "@noble/ed25519": "^2.2.3",

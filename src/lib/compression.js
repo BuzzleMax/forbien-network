@@ -370,7 +370,7 @@ export function decompressSOSData(compressed) {
         result.message = decompressSOSMessage(value);
         break;
       case 'TS':
-        result.timestamp = value;
+        result.timestamp = parseInt(value, 10) || value;
         break;
       case 'U':
         result.unitId = value;
