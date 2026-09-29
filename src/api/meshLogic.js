@@ -62,6 +62,7 @@ import { compressSOSData, decompressSOSData } from '../lib/compression.js';
 import {
   encryptPayloadAESGCM,
   decryptPayloadAESGCM,
+  buildAADBytes,
   DEFAULT_MESH_SECRET,
   isLegacyXORPacket,
   handleLegacyXORPacket,
@@ -131,17 +132,73 @@ const DUP_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour expiration for duplicate cach
 
 /** Reassembly buffers for fragmented BLE packets: messageId -> { total, received: Map<seq, data> } */
 const incomingFragmentBuffers = new Map();
+const FRAGMENT_BUFFER_TTL_MS = 60000; // 60 seconds
+const MAX_FRAGMENT_BUFFERS = 100;
+let fragmentCleanupInterval = null;
+
+function cleanupFragmentBuffers() {
+  const now = Date.now();
+  for (const [key, buffer] of incomingFragmentBuffers.entries()) {
+    if (now - buffer.createdAt > FRAGMENT_BUFFER_TTL_MS) {
+      console.warn(`[Fragment TTL] Expired incomplete buffer: ${key} (${buffer.received.size}/${buffer.total})`);
+      incomingFragmentBuffers.delete(key);
+    }
+  }
+  // Hard cap on buffer count
+  if (incomingFragmentBuffers.size > MAX_FRAGMENT_BUFFERS) {
+    // Evict oldest
+    const sorted = [...incomingFragmentBuffers.entries()].sort((a, b) => a[1].createdAt - b[1].createdAt);
+    while (incomingFragmentBuffers.size > MAX_FRAGMENT_BUFFERS) {
+      incomingFragmentBuffers.delete(sorted.shift()[0]);
+    }
+  }
+}
 
 // BLE Service UUID and Characteristic UUID for ForBien mesh
 export const MESH_SERVICE_UUID = '6E400001-B5A3-F393-E0A9-E50E24DCCA9E';
 export const MESH_CHARACTERISTIC_UUID = '6E400002-B5A3-F393-E0A9-E50E24DCCA9E';
 
-// Max BLE Characteristic payload fragment size (safe budget inside 244B MTU)
-const MAX_FRAGMENT_PAYLOAD_BYTES = 140;
+// [B3 Fix] FRAG string format: FRAG|{3-char-id}|{seq}|{total}|{data}
+// Actual bytes written via BLE = FRAG string length (btoa + ble-plx decode cancel out).
+// Worst-case header: "FRAG|"(5) + 3-char-fragId(3) + "|"(1) + 4-digit-seq(4) +
+//                   "|"(1) + 4-digit-total(4) + "|"(1) = 19 chars
+// Therefore: max safe fragSize = attPayload - 19
+const FRAG_PROTOCOL_OVERHEAD = 19;
+// Conservative fallback for unknown MTU: safe for minimum ATT payload (MTU 23 -> attPayload=20)
+// max(1, 20 - 19) = 1  (avoids crash; efficiency is poor on MTU 23 but correctness is preserved)
+const DEFAULT_SAFE_FRAGMENT_SIZE = 1;
+
+function getFragmentPayloadSize(peerId) {
+  const conn = activeConnections.get(peerId);
+  if (!conn || !conn.mtu) return DEFAULT_SAFE_FRAGMENT_SIZE;
+  // ATT PDU overhead: 1 byte opcode + 2 bytes handle = 3 bytes
+  const attPayload = conn.mtu - 3;
+  // Ensure at least 1 byte of data per fragment; FRAG_PROTOCOL_OVERHEAD accounts for all
+  // fixed header bytes so that: FRAG string length = FRAG_PROTOCOL_OVERHEAD + fragSize <= attPayload
+  return Math.max(1, attPayload - FRAG_PROTOCOL_OVERHEAD);
+}
 
 // Throttling intervals for battery preservation
 const ADVERTISING_THROTTLE_MS = 30000; // 30-second throttling for BLE advertising
 let lastAdvertisingTime = 0;
+let stalePruneInterval = null;
+
+function pruneStaleConnections() {
+  for (const [peerId, conn] of activeConnections.entries()) {
+    const device = conn.device || conn;
+    if (typeof device.isConnected === 'function') {
+      device.isConnected().then(isConn => {
+        if (!isConn) {
+          activeConnections.delete(peerId);
+          const peerData = peers.get(peerId);
+          if (peerData) peerData.verified = false;
+        }
+      }).catch(() => {
+        activeConnections.delete(peerId);
+      });
+    }
+  }
+}
 
 // Delivery state enum
 export const DELIVERY_STATES = {
@@ -150,21 +207,51 @@ export const DELIVERY_STATES = {
   CONNECTING: 'CONNECTING',
   TRANSMITTING: 'TRANSMITTING',
   TRANSMITTED: 'TRANSMITTED',
+  FORWARDED: 'FORWARDED',        // Written to >=1 peer, HQ receipt unconfirmed
   RECEIVED: 'RECEIVED',
   RELAYING: 'RELAYING',
   DELIVERED: 'DELIVERED',
   DELIVERED_TO_HQ: 'DELIVERED_TO_HQ',
   FAILED: 'FAILED',
+  EXPIRED: 'EXPIRED',
 };
 
 // Authorized Headquarters UUIDs for clearance packet validation
-const AUTHORIZED_HQ_UUIDS = new Set([
-  'FORBIEN-HQ-01',
-  'hq-command-primary-001',
-  'hq-command-secondary-002',
-  'hq-emergency-center-003',
-  'hq-ops-central-004',
-]);
+// Only one logical HQ identifier is authorized.
+// Authentication is enforced via Ed25519 signature, not UUID enumeration.
+const AUTHORIZED_HQ_UUIDS = new Set(['FORBIEN-HQ-01']);
+
+// Expiry for messages in FORWARDED/QUEUED state (24 hours)
+const MESSAGE_EXPIRY_MS = 24 * 60 * 60 * 1000;
+const MAX_REFORWARDS = 5;
+let reforwardSweepInterval = null;
+let bleStateSubscription = null;
+
+function sweepForwardedMessages() {
+  const now = Date.now();
+  for (const [msgId, msg] of persistentMessageQueue.entries()) {
+    // Expire old messages
+    if (now - (msg.storedAt || 0) > MESSAGE_EXPIRY_MS) {
+      msg.deliveryState = DELIVERY_STATES.EXPIRED;
+      persistentMessageQueue.delete(msgId);
+      emit('message_expired', { messageId: msgId });
+      continue;
+    }
+    // Re-forward messages stuck in FORWARDED state so new relay paths are tried
+    if (msg.deliveryState === DELIVERY_STATES.FORWARDED) {
+      const reforwardCount = msg._reforwardCount || 0;
+      if (reforwardCount < MAX_REFORWARDS) {
+        msg._reforwardCount = reforwardCount + 1;
+        msg.deliveryState = DELIVERY_STATES.QUEUED;
+        // Only re-queue if not already in outboundQueue
+        const alreadyQueued = outboundQueue.some(p => p.id === msgId);
+        if (!alreadyQueued) {
+          outboundQueue.push(msg);
+        }
+      }
+    }
+  }
+}
 
 // Master Mesh Secret Key (derived via HKDF/SHA-256 into 256-bit AES-GCM key)
 let currentMeshSecret = DEFAULT_MESH_SECRET;
@@ -447,7 +534,7 @@ export function isDuplicateMessage(messageId) {
  * @param {object} packet 
  * @returns {string[]} Array of formatted fragment strings
  */
-export function fragmentPacket(packet) {
+export function fragmentPacket(packet, maxPayloadBytes = DEFAULT_SAFE_FRAGMENT_SIZE) {
   const jsonStr = JSON.stringify(packet);
   let fullBase64 = '';
   try {
@@ -461,16 +548,20 @@ export function fragmentPacket(packet) {
   }
 
   const totalLength = fullBase64.length;
-  const totalFragments = Math.ceil(totalLength / MAX_FRAGMENT_PAYLOAD_BYTES);
-  const msgId = packet.id || `msg_${Date.now()}`;
+  const totalFragments = Math.ceil(totalLength / maxPayloadBytes);
+  // [B3 Fix] Use a compact 3-char hex fragmentation session ID instead of packet.id.
+  // This reduces FRAG header overhead from ~25+ chars (packet.id length) to exactly 3 chars,
+  // enabling safe transmission at all MTU values including MTU 23.
+  // The actual packet.id is preserved inside the base64-encoded payload.
+  const fragId = Math.floor(Math.random() * 4096).toString(16).padStart(3, '0');
   const fragments = [];
 
   for (let i = 0; i < totalFragments; i++) {
-    const start = i * MAX_FRAGMENT_PAYLOAD_BYTES;
-    const end = Math.min(start + MAX_FRAGMENT_PAYLOAD_BYTES, totalLength);
+    const start = i * maxPayloadBytes;
+    const end = Math.min(start + maxPayloadBytes, totalLength);
     const chunkBase64 = fullBase64.substring(start, end);
     const seq = i + 1;
-    const fragmentStr = `FRAG|${msgId}|${seq}|${totalFragments}|${chunkBase64}`;
+    const fragmentStr = `FRAG|${fragId}|${seq}|${totalFragments}|${chunkBase64}`;
     fragments.push(fragmentStr);
   }
 
@@ -482,7 +573,7 @@ export function fragmentPacket(packet) {
  * @param {string} fragStr 
  * @returns {object|null} Reassembled packet object if complete, or null if incomplete/corrupted
  */
-export function reassembleFragment(fragStr) {
+export function reassembleFragment(fragStr, peerId = 'unknown') {
   if (typeof fragStr !== 'string' || !fragStr.startsWith('FRAG|')) {
     return null;
   }
@@ -498,15 +589,18 @@ export function reassembleFragment(fragStr) {
     return null;
   }
 
-  if (!incomingFragmentBuffers.has(msgId)) {
-    incomingFragmentBuffers.set(msgId, {
+  const bufferKey = `${peerId}:${msgId}`;
+
+  if (!incomingFragmentBuffers.has(bufferKey)) {
+    incomingFragmentBuffers.set(bufferKey, {
       total,
       received: new Map(),
       createdAt: Date.now(),
+      peerId,
     });
   }
 
-  const buffer = incomingFragmentBuffers.get(msgId);
+  const buffer = incomingFragmentBuffers.get(bufferKey);
   buffer.received.set(seq, chunkBase64);
 
   // Check if all fragments have arrived
@@ -516,7 +610,7 @@ export function reassembleFragment(fragStr) {
       combinedBase64 += buffer.received.get(i) || '';
     }
 
-    incomingFragmentBuffers.delete(msgId);
+    incomingFragmentBuffers.delete(bufferKey);
 
     // Decode Base64 to string
     let decodedJsonStr = '';
@@ -581,8 +675,7 @@ export async function startScan() {
 
     const scanOptions = { allowDuplicates: true, scanMode: 2 }; // ScanMode.LowLatency
     
-    // Unfiltered scan to catch devices whose adv payload doesn't fit UUID perfectly
-    manager.startDeviceScan(null, scanOptions, (error, device) => {
+    manager.startDeviceScan([MESH_SERVICE_UUID], scanOptions, (error, device) => {
       if (error) {
         console.error('Scan error:', error);
         emit('scan_error', { error: error.message });
@@ -590,23 +683,25 @@ export async function startScan() {
       }
 
       if (device) {
+        const deviceId = device.id || '';
         const deviceName = device.name || device.localName || '';
         const serviceUuids = device.serviceUUIDs || [];
-        const isForBienService = serviceUuids.some(u => u && u.toLowerCase() === MESH_SERVICE_UUID.toLowerCase());
-        const isForBienName = deviceName.includes('ForBien') || deviceName.includes('FORBIEN');
-
-        if (isForBienService || isForBienName) {
-          const peerId = device.id;
-          const isHQDevice = deviceName.includes('ForBien-HQ') || deviceName.includes('FORBIEN-HQ');
-          
-          const peerData = {
-            id: peerId,
-            name: deviceName || `Unit ${peerId.substring(0, 6)}`,
-            rssi: device.rssi,
-            device: device,
-            isHQ: isHQDevice,
-            serviceUUIDs: serviceUuids
-          };
+        
+        console.log(`[FORBIEN_DISCOVERED] deviceId=${deviceId}`);
+        console.log(`[FORBIEN_ACCEPTED] deviceId=${deviceId}`);
+        
+        const peerId = device.id;
+        const isHQDevice = deviceName.includes('ForBien-HQ') || deviceName.includes('FORBIEN-HQ');
+        
+        const peerData = {
+          id: peerId,
+          name: deviceName || `Unit ${peerId.substring(0, 6)}`,
+          rssi: device.rssi,
+          device: device,
+          isHQ: isHQDevice,
+          serviceUUIDs: serviceUuids,
+          verified: false
+        };
 
         const existing = peers.get(peerId);
         if (!existing || existing.rssi !== device.rssi) {
@@ -621,7 +716,6 @@ export async function startScan() {
           
           // Trigger queue processing when new peer discovered
           processOutboundQueue();
-        }
         }
       }
     });
@@ -721,7 +815,7 @@ export async function handleIncomingRawBLEData(rawString, senderInfo = 'BLE_Peer
 
   let packet = null;
   if (decodedStr.startsWith('FRAG|')) {
-    packet = reassembleFragment(decodedStr);
+    packet = reassembleFragment(decodedStr, senderInfo);
     if (!packet) {
       // Waiting for remaining fragments
       return { ok: true, pendingFragments: true };
@@ -751,22 +845,40 @@ export async function processIncomingPacket(packet, senderInfo = 'BLE_Peer') {
   // STEP 0: Handle HQ Authentication Handshake packets
   // These are NOT emergency messages — they are cryptographic identity proofs from the HQ device
   if (packet.type === 'HQ_AUTH_HANDSHAKE') {
+    // [B2 Fix] senderInfo MUST be the stable BLE device ID (MAC address), not the device name.
+    // The authenticatedHQPeers Map is keyed by senderInfo here and later filtered by p.id
+    // (the BLE MAC address from scan) in processOutboundQueue. Only a MAC-keyed entry will match.
+    console.log(`[FORBIEN_HQ_AUTH_START] Verifying Ed25519 HQ handshake from peer ${senderInfo}`);
     const verifyResult = verifyHQAuthHandshake(packet);
     if (verifyResult.valid) {
-      // Record this peer as a cryptographically verified HQ
+      // Record this peer's stable BLE device ID as a cryptographically verified HQ
       authenticatedHQPeers.set(senderInfo, {
         timestamp: Date.now(),
         handshake: packet,
         nodeId: packet.nodeId,
         publicKey: packet.publicKey,
       });
-      console.log(`[HQ Auth] Peer ${senderInfo} VERIFIED as Authorized FORBIEN-HQ-01`);
+      console.log(`[FORBIEN_HQ_AUTH_SUCCESS] Peer ${senderInfo} verified as authorized FORBIEN-HQ-01`);
       emit('hq_peer_authenticated', { peerId: senderInfo, nodeId: packet.nodeId, publicKey: packet.publicKey });
     } else {
-      console.warn(`[HQ Auth] REJECTED fake HQ claim from peer ${senderInfo}: ${verifyResult.reason}`);
+      console.warn(`[FORBIEN_HQ_AUTH_REJECT] Peer ${senderInfo}: ${verifyResult.reason}`);
       emit('fake_hq_rejected', { peerId: senderInfo, reason: verifyResult.reason });
     }
     return { ok: verifyResult.valid, hqAuthHandshake: true, verified: verifyResult.valid, reason: verifyResult.reason };
+  }
+
+  // MANDATORY ENCRYPTION GATE — reject all unencrypted production packets
+  const payloadEnvelope = packet.payload || packet;
+  const isAuthenticallyEncrypted = payloadEnvelope &&
+    typeof payloadEnvelope === 'object' &&
+    payloadEnvelope.v === 2 &&
+    payloadEnvelope.iv &&
+    payloadEnvelope.ct;
+
+  if (!isAuthenticallyEncrypted) {
+    console.warn(`[SECURITY REJECT] Packet ${packet.id} rejected: missing AES-256-GCM envelope`);
+    emit('unauthenticated_packet_rejected', { messageId: packet.id, reason: 'No AES-256-GCM envelope' });
+    return { ok: false, rejected: true, error: 'Packet rejected: AES-256-GCM encryption required' };
   }
 
   // STEP 1 & STEP 2: DUPLICATE PROTECTION CHECK
@@ -785,25 +897,28 @@ export async function processIncomingPacket(packet, senderInfo = 'BLE_Peer') {
   if (isTargetDestination) {
     console.log(`[Mesh Delivery] Packet ${packet.id} reached destination node ${localId}!`);
 
-    // Decrypt payload if encrypted
-    let decryptedData = null;
-    const payloadEnvelope = packet.payload || packet;
-    const isEncrypted = packet.encrypted || (payloadEnvelope && (payloadEnvelope.algo === 'AES-256-GCM' || payloadEnvelope.v === 2));
-
-    if (isEncrypted) {
-      const decryptRes = await decryptPayloadAESGCM(payloadEnvelope, currentMeshSecret);
-      if (decryptRes.legacy) {
-        console.warn('[Mesh Security] Legacy XOR packet rejected from incoming stream.');
-        return { ok: false, legacy: true, error: 'Legacy XOR dropped' };
-      }
-      if (!decryptRes.ok) {
-        console.warn('[Mesh Security Alert] AES-256-GCM authentication tag failed on incoming packet!');
-        return { ok: false, tampered: true, error: decryptRes.error };
-      }
-      decryptedData = decryptRes.data;
-    } else {
-      decryptedData = packet.plainData || packet.payload || {};
+    // Mandatory decryption (already passed encryption gate)
+    const payloadEnv = packet.payload || packet;
+    // Reconstruct AAD from packet header fields to verify metadata integrity
+    const receiverAAD = buildAADBytes({
+      id: packet.id,
+      sourceNodeId: packet.sourceNodeId,
+      destinationNodeId: packet.destinationNodeId || HQ_NODE_ID,
+      type: packet.type,
+      ts: packet.ts,
+    });
+    const decryptRes = await decryptPayloadAESGCM(payloadEnv, currentMeshSecret, receiverAAD);
+    
+    if (decryptRes.legacy) {
+      console.warn('[Mesh Security] Legacy XOR packet rejected from incoming stream.');
+      return { ok: false, legacy: true, error: 'Legacy XOR dropped' };
     }
+    if (!decryptRes.ok) {
+      console.warn('[Mesh Security Alert] AES-256-GCM authentication tag failed on incoming packet!');
+      return { ok: false, tampered: true, error: decryptRes.error };
+    }
+    
+    let decryptedData = decryptRes.data;
 
     // Extract SOS or message text
     let messageText = decryptedData.text || decryptedData.message || '[Encrypted Data]';
@@ -839,8 +954,8 @@ export async function processIncomingPacket(packet, senderInfo = 'BLE_Peer') {
       routeHistory: routeHist,
       hopCount: packet.hopCount || 0,
       maxHops: packet.maxHops || 5,
-      encrypted: isEncrypted,
-      algo: isEncrypted ? 'AES-256-GCM' : undefined,
+      encrypted: true,
+      algo: 'AES-256-GCM',
       compressed: !!processedPayload.compressed,
       decompressed: !!processedPayload.decompressed,
       type: packet.type || processedPayload.type || 'SOS',
@@ -971,7 +1086,22 @@ export async function processOutboundQueue() {
         break;
       }
 
-      for (const peer of availablePeers) {
+      // [B2 Fix] For HQ-destined packets, prefer routing to cryptographically authenticated HQ peers.
+      // authenticatedHQPeers is keyed by the stable BLE device ID (MAC address) because
+      // senderInfo is now always event.deviceId (see onIncomingWrite). p.id is also the BLE MAC
+      // from the scan, so authenticatedHQPeers.has(p.id) now correctly finds the verified entry.
+      let targetPeers = availablePeers;
+      if (packet.destinationNodeId === HQ_NODE_ID) {
+        const authHQPeers = availablePeers.filter(p => authenticatedHQPeers.has(p.id));
+        if (authHQPeers.length > 0) {
+          targetPeers = authHQPeers;
+          console.log(`[FORBIEN_HQ_ROUTE_SELECTED] Routing packet ${packet.id} to ${authHQPeers.length} authenticated HQ peer(s): ${authHQPeers.map(p => p.id).join(', ')}`);
+        } else {
+          console.log(`[BLE Routing] No authenticated HQ peers — broadcasting to all ${availablePeers.length} peer(s) for store-and-forward`);
+        }
+      }
+
+      for (const peer of targetPeers) {
         if (!peer.device) continue;
 
         try {
@@ -987,8 +1117,9 @@ export async function processOutboundQueue() {
           emit('delivery_state_change', { packetId: packet.id, state: DELIVERY_STATES.TRANSMITTING });
 
           // Fragment packet into MTU-safe BLE chunks
-          const fragments = fragmentPacket(packet);
-          console.log(`[BLE Transport] Transmitting packet ${packet.id} in ${fragments.length} fragment(s) to ${peer.id}...`);
+          const fragSize = getFragmentPayloadSize(peer.id);
+          const fragments = fragmentPacket(packet, fragSize);
+          console.log(`[BLE Transport] Transmitting packet ${packet.id} in ${fragments.length} fragment(s) to ${peer.id} at ${fragSize} bytes/frag...`);
 
           for (const frag of fragments) {
             let base64Payload = '';
@@ -1018,12 +1149,21 @@ export async function processOutboundQueue() {
         } catch (writeErr) {
           console.warn(`[BLE Write Error] Failed write to peer ${peer.id}:`, writeErr.message);
           activeConnections.delete(peer.id);
+          try {
+            if (typeof connectedDevice.cancelConnection === 'function') {
+              await connectedDevice.cancelConnection().catch(() => {});
+            }
+          } catch {}
         }
       }
 
       if (transmittedToAnyPeer) {
-        // Shift item out of queue only after physical BLE write succeeds
-        outboundQueue.shift();
+        // Move to FORWARDED state — HQ delivery unconfirmed but packet is in flight
+        const forwardedPacket = outboundQueue.shift();
+        forwardedPacket.deliveryState = DELIVERY_STATES.FORWARDED;
+        forwardedPacket.forwardedAt = Date.now();
+        storeMessagePersistent(forwardedPacket);
+        emit('delivery_state_change', { packetId: forwardedPacket.id, state: DELIVERY_STATES.FORWARDED });
         await saveQueuesToStorage();
       } else {
         // Could not transmit to any peer in this pass
@@ -1065,13 +1205,61 @@ export async function enableMesh() {
     // Check peripheral support before starting mesh
     await checkPeripheralSupport();
 
+    // CRITICAL: Restore queues BEFORE enabling mesh processing
+    await loadQueuesFromStorage();
+
     meshEnabled = true;
+
+    if (stalePruneInterval) clearInterval(stalePruneInterval);
+    stalePruneInterval = setInterval(pruneStaleConnections, 60000);
+
+    if (fragmentCleanupInterval) clearInterval(fragmentCleanupInterval);
+    fragmentCleanupInterval = setInterval(cleanupFragmentBuffers, 30000);
+
+    if (reforwardSweepInterval) clearInterval(reforwardSweepInterval);
+    reforwardSweepInterval = setInterval(sweepForwardedMessages, 120000);
+
+    // Register Bluetooth state change listener for OFF/ON recovery
+    if (!bleStateSubscription && typeof manager.onStateChange === 'function') {
+      bleStateSubscription = manager.onStateChange(async (state) => {
+        console.log(`[Bluetooth] State changed to: ${state}`);
+        emit('bluetooth_state', { state });
+        if (state === 'PoweredOff') {
+          // Pause: clear connections but preserve queues and meshEnabled intent
+          for (const [pid, conn] of activeConnections.entries()) {
+            try { const d = conn.device || conn; await d.cancelConnection().catch(() => {}); } catch {}
+          }
+          activeConnections.clear();
+          connectingPeers.clear();
+          emit('mesh_paused', { reason: 'bluetooth_off' });
+        } else if (state === 'PoweredOn' && meshEnabled) {
+          // Recover: wait for BLE stack stability then restart scan/advertise
+          setTimeout(async () => {
+            try { await startScan(); } catch {}
+            try {
+              if (peripheralSupported) await startBroadcast();
+            } catch {}
+            processOutboundQueue();
+            emit('mesh_recovered', {});
+          }, 1000);
+        }
+      }, true); // true = emit current state immediately
+    }
 
     // Attach native GATT write listener for inbound BLE packets
     if (!nativeWriteUnsub) {
       nativeWriteUnsub = blePeripheral.onIncomingWrite((event) => {
         if (event && event.dataBase64) {
-          handleIncomingRawBLEData(event.dataBase64, event.deviceName || event.deviceId);
+          // [B2 Fix] Use event.deviceId (stable BLE MAC address) as the SOLE authoritative peer identity.
+          // event.deviceName is a user-visible string and can be spoofed; it MUST NEVER be used
+          // as the identity key for authenticatedHQPeers or any authentication decision.
+          // If deviceId is missing, use a unique fallback that can never match a real scan peer.id,
+          // preventing any HQ auth from succeeding without a proper MAC address.
+          const senderIdentity = event.deviceId;
+          if (!senderIdentity) {
+            console.warn('[FORBIEN_HQ_AUTH_REJECT] Incoming write has no deviceId — device name will NOT be used as identity');
+          }
+          handleIncomingRawBLEData(event.dataBase64, senderIdentity || `UNKNOWN_DEVICE_${Date.now()}`);
         }
       });
     }
@@ -1115,6 +1303,35 @@ export async function disableMesh() {
   meshEnabled = false;
   
   try {
+    // Cancel all active GATT connections
+    for (const [peerId, conn] of activeConnections.entries()) {
+      try {
+        const device = conn.device || conn;
+        if (typeof device.cancelConnection === 'function') {
+          await device.cancelConnection().catch(() => {});
+        }
+      } catch {}
+    }
+    activeConnections.clear();
+    connectingPeers.clear();
+    if (stalePruneInterval) {
+      clearInterval(stalePruneInterval);
+      stalePruneInterval = null;
+    }
+    if (fragmentCleanupInterval) {
+      clearInterval(fragmentCleanupInterval);
+      fragmentCleanupInterval = null;
+    }
+    incomingFragmentBuffers.clear();
+
+    if (reforwardSweepInterval) {
+      clearInterval(reforwardSweepInterval);
+      reforwardSweepInterval = null;
+    }
+    if (bleStateSubscription) {
+      if (typeof bleStateSubscription.remove === 'function') bleStateSubscription.remove();
+      bleStateSubscription = null;
+    }
     if (nativeWriteUnsub) {
       nativeWriteUnsub();
       nativeWriteUnsub = null;
@@ -1176,7 +1393,15 @@ export async function sendToGroup(groupId, payload) {
   let processedPayload = { ...payload };
   let isEncrypted = false;
   let envelope = null;
-  
+
+  // Declare IDs and a SINGLE timestamp before encryption.
+  // [B1 Fix] Capture timestamp once so that the AAD ts and packet.ts are byte-for-byte identical.
+  // Two separate Date.now() calls can differ by >=1 ms, producing different AAD byte sequences
+  // and causing GCM authentication to fail at the receiver.
+  const messageId = `m_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
+  const originNodeId = getLocalNodeId();
+  const timestamp = Date.now(); // [B1 Fix] Single reference — used for both AAD ts and entry.ts
+
   if (meshEnabled) {
     if (payload.type === 'SOS' || payload.text?.toLowerCase().includes('sos')) {
       const sosData = {
@@ -1190,30 +1415,34 @@ export async function sendToGroup(groupId, payload) {
         timestamp: Date.now(),
         unitId: payload.meta?.unitId,
       };
-      
+
       const compressedStr = compressSOSData(sosData);
       processedPayload = { compressed: compressedStr };
     }
-    
-    const encryptRes = await encryptPayloadAESGCM(processedPayload, currentMeshSecret);
+
+    const encryptRes = await encryptPayloadAESGCM(processedPayload, currentMeshSecret, {
+      id: messageId,
+      sourceNodeId: originNodeId,
+      destinationNodeId: payload.destinationNodeId || HQ_NODE_ID,
+      type: payload.type || 'SOS',
+      ts: timestamp, // [B1 Fix] Same timestamp variable used for packet.ts below
+    });
     if (encryptRes.ok) {
       envelope = encryptRes.envelope;
       isEncrypted = true;
     }
   }
 
-  const messageId = `m_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
-
-  const originNodeId = getLocalNodeId();
   const entry = {
     id: messageId,
     groupId,
     sourceNodeId: originNodeId,
     destinationNodeId: payload.destinationNodeId || HQ_NODE_ID,
+    type: payload.type || 'SOS', // [B1 Fix] Must match the type used in AAD above — receiver reconstructs AAD from packet.type
     routeHistory: [originNodeId],
     payload: isEncrypted ? envelope : processedPayload,
     plainPayload: processedPayload,
-    ts: Date.now(),
+    ts: timestamp, // [B1 Fix] Matches the ts used in the AAD above — receiver AAD reconstruction will produce identical bytes
     mode: meshEnabled ? 'mesh' : 'internet',
     hopCount: 0,
     maxHops: 5,
@@ -1251,10 +1480,11 @@ export async function connectToPeer(peerId) {
   // If already connected and active, reuse connection
   if (activeConnections.has(peerId)) {
     const existing = activeConnections.get(peerId);
+    const existingDevice = existing.device || existing;
     try {
-      const isConn = await existing.isConnected();
+      const isConn = await existingDevice.isConnected();
       if (isConn) {
-        return { ok: true, device: existing };
+        return { ok: true, device: existingDevice };
       }
     } catch {
       activeConnections.delete(peerId);
@@ -1266,15 +1496,86 @@ export async function connectToPeer(peerId) {
     return { ok: false, error: 'Connection attempt already in progress' };
   }
 
+  const MAX_CONCURRENT_CONNECTIONS = 3;
+  if (connectingPeers.size >= MAX_CONCURRENT_CONNECTIONS) {
+    return { ok: false, error: 'Max concurrent connections reached' };
+  }
+
   connectingPeers.add(peerId);
 
   try {
     const device = peer.device;
-    console.log(`[BLE Transport] Attempting connection to peer ${peerId}...`);
+    console.log(`[FORBIEN_CONNECT_START] deviceId=${peerId}`);
+    
     const connected = await withTimeout(device.connect(), 8000, `Connection timeout to peer ${peerId}`);
+    console.log(`[FORBIEN_CONNECT_SUCCESS] deviceId=${peerId}`);
+    
+    let negotiatedMTU = 23;
+    try {
+      if (typeof connected.requestMTU === 'function') {
+        const connectedWithMtu = await withTimeout(connected.requestMTU(256), 3000, 'MTU negotiation timeout');
+        negotiatedMTU = connectedWithMtu.mtu || 23;
+        console.log(`[FORBIEN_MTU] Negotiated MTU: ${negotiatedMTU} for peer ${peerId}`);
+      }
+    } catch (mtuErr) {
+      console.warn(`[FORBIEN_MTU] MTU negotiation failed, using default:`, mtuErr.message);
+    }
+    
     await withTimeout(connected.discoverAllServicesAndCharacteristics(), 8000, `Service discovery timeout for peer ${peerId}`);
     
-    activeConnections.set(peerId, connected);
+    let services = [];
+    try {
+      services = await connected.services();
+    } catch (sErr) {
+      console.warn('Could not fetch services list after discovery:', sErr.message);
+    }
+    
+    const normTargetService = normalizeUuid(MESH_SERVICE_UUID);
+    const targetService = services.find(s => normalizeUuid(s.uuid) === normTargetService);
+    
+    if (targetService) {
+      console.log(`[FORBIEN_SERVICE_FOUND] serviceUUID=${targetService.uuid}`);
+      let characteristics = [];
+      try {
+        characteristics = await targetService.characteristics();
+      } catch (cErr) {
+        console.warn('Could not fetch characteristics list:', cErr.message);
+      }
+      
+      const normTargetChar = normalizeUuid(MESH_CHARACTERISTIC_UUID);
+      const targetChar = characteristics.find(c => normalizeUuid(c.uuid) === normTargetChar);
+      
+      if (targetChar) {
+        console.log(`[FORBIEN_CHARACTERISTIC_FOUND] characteristicUUID=${targetChar.uuid}`);
+      } else {
+        throw new Error('ForBien Characteristic Missing');
+      }
+    } else {
+      throw new Error('ForBien Service Missing');
+    }
+
+    // Mark as fully verified ForBien device
+    if (!peer.verified) {
+      peer.verified = true;
+      peers.set(peerId, peer);
+    }
+
+    // Set up disconnect listener
+    if (typeof connected.onDisconnected === 'function') {
+      connected.onDisconnected((error, disconnectedDevice) => {
+        console.log(`[BLE] Peer ${peerId} disconnected:`, error?.message || 'Unknown reason');
+        activeConnections.delete(peerId);
+        connectingPeers.delete(peerId);
+        const peerData = peers.get(peerId);
+        if (peerData) {
+          peerData.verified = false;
+          peers.set(peerId, peerData);
+        }
+        emit('peer_disconnected', { peerId, reason: error?.message });
+      });
+    }
+
+    activeConnections.set(peerId, { device: connected, mtu: negotiatedMTU });
     connectingPeers.delete(peerId);
     
     emit('peer_connected', { peerId });
@@ -1282,6 +1583,13 @@ export async function connectToPeer(peerId) {
   } catch (error) {
     connectingPeers.delete(peerId);
     activeConnections.delete(peerId);
+    
+    if (error.message === 'ForBien Service Missing' || error.message === 'ForBien Characteristic Missing') {
+      console.warn(`[FORBIEN_INVALID_PEER] Removing ${peerId} from peers list`);
+      peers.delete(peerId);
+      emit('mesh_state', { enabled: meshEnabled, peers: peers.size });
+    }
+
     console.warn(`[BLE Transport] Failed connection to peer ${peerId}:`, error.message);
     try {
       if (peer.device && typeof peer.device.cancelConnection === 'function') {
@@ -1304,14 +1612,16 @@ export async function disconnectFromPeer(peerId) {
   activeConnections.delete(peerId);
 
   const peer = peers.get(peerId);
-  const device = activeDev || (peer ? peer.device : null);
+  const device = (activeDev && activeDev.device) ? activeDev.device : (activeDev || (peer ? peer.device : null));
 
   if (!device) {
     return { ok: false, error: 'Peer not found' };
   }
 
   try {
-    await device.cancelConnection();
+    if (typeof device.cancelConnection === 'function') {
+      await device.cancelConnection();
+    }
     emit('peer_disconnected', { peerId });
     return { ok: true };
   } catch (error) {
@@ -1331,16 +1641,16 @@ export function drainOutboundQueue() {
 
 /**
  * Process a clearance packet from authorized HQ.
+ * MANDATORY: Clearance must be signed with the HQ Ed25519 private key.
  */
 export async function processClearancePacket(clearancePacketInput) {
   let clearancePacket = clearancePacketInput;
 
-  const isEncryptedEnvelope = clearancePacketInput && (
-    clearancePacketInput.v === 2 ||
+  const isEncryptedEnvelope = clearancePacketInput &&
+    (clearancePacketInput.v === 2 ||
     clearancePacketInput.algo === 'AES-256-GCM' ||
     typeof clearancePacketInput === 'string' ||
-    (clearancePacketInput.iv && clearancePacketInput.ct)
-  );
+    (clearancePacketInput.iv && clearancePacketInput.ct));
 
   if (isEncryptedEnvelope) {
     const decryptRes = await decryptPayloadAESGCM(clearancePacketInput, currentMeshSecret);
@@ -1350,8 +1660,36 @@ export async function processClearancePacket(clearancePacketInput) {
     clearancePacket = decryptRes.data;
   }
 
-  if (!clearancePacket || !clearancePacket.messageId || !AUTHORIZED_HQ_UUIDS.has(clearancePacket.hqUuid)) {
-    return { ok: false, error: 'Unauthorized HQ clearance signature' };
+  if (!clearancePacket || !clearancePacket.messageId) {
+    return { ok: false, error: 'Invalid clearance packet structure' };
+  }
+
+  // MANDATORY: Verify Ed25519 signature — UUID matching alone is NOT authentication
+  if (!clearancePacket.signature || !clearancePacket.publicKey || !clearancePacket.timestamp || !clearancePacket.nonce) {
+    console.warn('[Clearance] Rejected: missing cryptographic signature fields');
+    return { ok: false, error: 'Missing cryptographic clearance signature' };
+  }
+
+  // Verify public key matches the authorized HQ key
+  const authorizedPubKey = getAuthorizedHQPublicKey();
+  if (authorizedPubKey && clearancePacket.publicKey.toLowerCase() !== authorizedPubKey.toLowerCase()) {
+    console.warn('[Clearance] Rejected: public key does not match authorized HQ');
+    return { ok: false, error: 'Clearance public key does not match authorized HQ' };
+  }
+
+  // Verify Ed25519 signature
+  const dataStr = `FORBIEN_CLEARANCE|${clearancePacket.messageId}|${clearancePacket.timestamp}|${clearancePacket.nonce}`;
+  const isValid = verifyHQAuthenticationToken(clearancePacket.publicKey, dataStr, clearancePacket.signature);
+  if (!isValid) {
+    console.warn('[Clearance] Rejected: invalid Ed25519 clearance signature — possible forgery');
+    emit('fake_clearance_rejected', { reason: 'Invalid Ed25519 signature' });
+    return { ok: false, error: 'Invalid Ed25519 clearance signature — forgery detected' };
+  }
+
+  // Anti-replay: reject clearances older than 1 hour
+  const age = Date.now() - clearancePacket.timestamp;
+  if (age > 3600000) {
+    return { ok: false, error: 'Clearance packet too old — possible replay attack' };
   }
 
   const { messageId } = clearancePacket;
@@ -1363,7 +1701,7 @@ export async function processClearancePacket(clearancePacketInput) {
   const clearedMessage = persistentMessageQueue.get(messageId);
   persistentMessageQueue.delete(messageId);
 
-  emit('message_cleared', { messageId, hqUuid: clearancePacket.hqUuid, clearedMessage });
+  emit('message_cleared', { messageId, hqUuid: clearancePacket.hqUuid || HQ_NODE_ID, clearedMessage });
 
   return { ok: true, clearedMessageId: messageId, clearedMessage };
 }
@@ -1396,19 +1734,39 @@ export async function saveQueuesToStorage() {
 }
 
 export async function loadQueuesFromStorage() {
+  const MESSAGE_EXPIRY_MS_LOAD = 24 * 60 * 60 * 1000;
+  const now = Date.now();
   try {
     const rawOutbound = await AsyncStorage.getItem(QUEUE_STORAGE_KEY);
     if (rawOutbound) {
       const parsed = JSON.parse(rawOutbound);
       outboundQueue.length = 0;
-      outboundQueue.push(...parsed);
+      parsed.forEach(item => {
+        // Reset interrupted transient states so packet is retried
+        if (item.deliveryState === DELIVERY_STATES.CONNECTING ||
+            item.deliveryState === DELIVERY_STATES.TRANSMITTING) {
+          item.deliveryState = DELIVERY_STATES.QUEUED;
+        }
+        // Skip expired packets
+        if (item.ts && now - item.ts > MESSAGE_EXPIRY_MS_LOAD) {
+          return;
+        }
+        outboundQueue.push(item);
+      });
     }
     const rawPersistent = await AsyncStorage.getItem(PERSISTENT_STORAGE_KEY);
     if (rawPersistent) {
       const parsed = JSON.parse(rawPersistent);
       persistentMessageQueue.clear();
-      parsed.forEach(([k, v]) => persistentMessageQueue.set(k, v));
+      parsed.forEach(([k, v]) => {
+        // Skip expired
+        if (v.storedAt && now - v.storedAt > MESSAGE_EXPIRY_MS_LOAD) {
+          return;
+        }
+        persistentMessageQueue.set(k, v);
+      });
     }
+    console.log(`[Queue Restore] Loaded ${outboundQueue.length} outbound, ${persistentMessageQueue.size} persistent messages`);
   } catch (err) {
     console.error('Failed to load queues from AsyncStorage:', err);
   }
@@ -1520,7 +1878,14 @@ export async function createOfflineEmergencyMessage(options = {}) {
 
   let envelope = null;
   try {
-    const encryptRes = await encryptPayloadAESGCM({ compressed: compressedStr }, currentMeshSecret);
+    const aadObject = {
+      id: messageId,
+      sourceNodeId: originNodeId,
+      destinationNodeId: HQ_NODE_ID,
+      type: 'SOS',
+      ts: timestamp,
+    };
+    const encryptRes = await encryptPayloadAESGCM({ compressed: compressedStr }, currentMeshSecret, aadObject);
     if (encryptRes.ok) {
       envelope = encryptRes.envelope;
     } else {

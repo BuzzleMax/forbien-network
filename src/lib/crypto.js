@@ -307,7 +307,7 @@ export function sha256JS(bytes) {
   return out;
 }
 
-function encryptAESGCM_JS(plaintextBytes, keyBytes, ivBytes) {
+function encryptAESGCM_JS(plaintextBytes, keyBytes, ivBytes, aadBytes = new Uint8Array(0)) {
   const w = keyExpansion256(keyBytes);
   const H = aesEncryptBlock(new Uint8Array(16), w);
 
@@ -335,13 +335,24 @@ function encryptAESGCM_JS(plaintextBytes, keyBytes, ivBytes) {
   }
 
   // Construct data for GHASH: pad(AAD) || pad(C) || len(AAD)_64 || len(C)_64
+  const aadPadLen = (16 - (aadBytes.length % 16)) % 16;
   const cPadLen = (16 - (ciphertext.length % 16)) % 16;
-  const ghashData = new Uint8Array(ciphertext.length + cPadLen + 16);
-  ghashData.set(ciphertext, 0);
+  const ghashData = new Uint8Array(aadBytes.length + aadPadLen + ciphertext.length + cPadLen + 16);
+  ghashData.set(aadBytes, 0);
+  ghashData.set(ciphertext, aadBytes.length + aadPadLen);
 
   const ghashView = new DataView(ghashData.buffer);
-  const bitLenC = ciphertext.length * 8;
-  ghashView.setUint32(ghashData.length - 4, bitLenC, false);
+  // Big-endian 64-bit lengths (upper 32 bits always 0 for reasonable sizes)
+  ghashView.setUint32(ghashData.length - 8, 0, false);
+  ghashView.setUint32(ghashData.length - 4, (aadBytes.length * 8) >>> 0, false);
+  // Overwrite last 8 bytes with len(C): use offsets ghashData.length-16+8 = ghashData.length-8 already used for len(AAD)
+  // Correct layout: bytes[-16..-9] = len(AAD)_64, bytes[-8..-1] = len(C)_64
+  const lenFieldBase = ghashData.length - 16;
+  const viewLen = new DataView(ghashData.buffer);
+  viewLen.setUint32(lenFieldBase,     0, false);
+  viewLen.setUint32(lenFieldBase + 4, (aadBytes.length * 8) >>> 0, false);
+  viewLen.setUint32(lenFieldBase + 8, 0, false);
+  viewLen.setUint32(lenFieldBase + 12, (ciphertext.length * 8) >>> 0, false);
 
   const S = ghash(H, ghashData);
   const J0Enc = aesEncryptBlock(J0, w);
@@ -357,7 +368,7 @@ function encryptAESGCM_JS(plaintextBytes, keyBytes, ivBytes) {
   return result;
 }
 
-function decryptAESGCM_JS(ciphertextWithTagBytes, keyBytes, ivBytes) {
+function decryptAESGCM_JS(ciphertextWithTagBytes, keyBytes, ivBytes, aadBytes = new Uint8Array(0)) {
   if (ciphertextWithTagBytes.length < 16) {
     throw new Error('Invalid AES-GCM ciphertext length');
   }
@@ -372,14 +383,19 @@ function decryptAESGCM_JS(ciphertextWithTagBytes, keyBytes, ivBytes) {
   J0.set(ivBytes.subarray(0, 12));
   J0[15] = 1;
 
-  // Construct data for GHASH
+  // Construct data for GHASH: pad(AAD) || pad(C) || len(AAD)_64 || len(C)_64
+  const aadPadLen = (16 - (aadBytes.length % 16)) % 16;
   const cPadLen = (16 - (ciphertext.length % 16)) % 16;
-  const ghashData = new Uint8Array(ciphertext.length + cPadLen + 16);
-  ghashData.set(ciphertext, 0);
+  const ghashData = new Uint8Array(aadBytes.length + aadPadLen + ciphertext.length + cPadLen + 16);
+  ghashData.set(aadBytes, 0);
+  ghashData.set(ciphertext, aadBytes.length + aadPadLen);
 
-  const ghashView = new DataView(ghashData.buffer);
-  const bitLenC = ciphertext.length * 8;
-  ghashView.setUint32(ghashData.length - 4, bitLenC, false);
+  const lenFieldBase = ghashData.length - 16;
+  const viewLen = new DataView(ghashData.buffer);
+  viewLen.setUint32(lenFieldBase,     0, false);
+  viewLen.setUint32(lenFieldBase + 4, (aadBytes.length * 8) >>> 0, false);
+  viewLen.setUint32(lenFieldBase + 8, 0, false);
+  viewLen.setUint32(lenFieldBase + 12, (ciphertext.length * 8) >>> 0, false);
 
   const S = ghash(H, ghashData);
   const J0Enc = aesEncryptBlock(J0, w);
@@ -448,15 +464,36 @@ export async function deriveMeshCryptoKey(secretString = DEFAULT_MESH_SECRET) {
 }
 
 /**
- * Encrypt a string or object payload using AES-256-GCM
+ * Build canonical AAD bytes from a packet metadata object.
+ * Fields that MUST NOT be tampered: id, sourceNodeId, destinationNodeId, type, ts.
+ * Fields intentionally excluded: hopCount, maxHops, routeHistory (relay-mutable).
  */
-export async function encryptPayloadAESGCM(data, secretKeyString = DEFAULT_MESH_SECRET) {
+export function buildAADBytes(aadObject) {
+  if (!aadObject) return new Uint8Array(0);
+  const canonical = JSON.stringify({
+    id: aadObject.id || '',
+    sourceNodeId: aadObject.sourceNodeId || '',
+    destinationNodeId: aadObject.destinationNodeId || '',
+    type: aadObject.type || '',
+    ts: aadObject.ts || 0,
+  });
+  return new TextEncoder().encode(canonical);
+}
+
+/**
+ * Encrypt a string or object payload using AES-256-GCM with optional AAD.
+ * @param {string|object} data - Payload to encrypt
+ * @param {string} secretKeyString - Mesh shared secret
+ * @param {object|null} aadObject - Authenticated metadata (id, sourceNodeId, destinationNodeId, type, ts)
+ */
+export async function encryptPayloadAESGCM(data, secretKeyString = DEFAULT_MESH_SECRET, aadObject = null) {
   try {
     const textToEncrypt = typeof data === 'object' ? JSON.stringify(data) : String(data);
     const encoder = new TextEncoder();
     const plaintextBytes = encoder.encode(textToEncrypt);
 
     const iv = getRandomValues(new Uint8Array(12));
+    const aadBytes = buildAADBytes(aadObject);
 
     let ciphertextBytes;
 
@@ -465,7 +502,7 @@ export async function encryptPayloadAESGCM(data, secretKeyString = DEFAULT_MESH_
         const key = await deriveMeshCryptoKey(secretKeyString);
         if (key instanceof CryptoKey) {
           const encryptedBuffer = await globalThis.crypto.subtle.encrypt(
-            { name: 'AES-GCM', iv },
+            { name: 'AES-GCM', iv, additionalData: aadBytes.length > 0 ? aadBytes : undefined },
             key,
             plaintextBytes
           );
@@ -478,13 +515,15 @@ export async function encryptPayloadAESGCM(data, secretKeyString = DEFAULT_MESH_
 
     if (!ciphertextBytes) {
       const keyBytes = sha256JS(encoder.encode(secretKeyString));
-      ciphertextBytes = encryptAESGCM_JS(plaintextBytes, keyBytes, iv);
+      ciphertextBytes = encryptAESGCM_JS(plaintextBytes, keyBytes, iv, aadBytes);
     }
 
     const envelope = {
       v: PROTOCOL_VERSION,
       iv: uint8ToBase64(iv),
       ct: uint8ToBase64(ciphertextBytes),
+      // Store serialized AAD so receiver can reconstruct for GCM tag verification
+      ...(aadObject ? { aad: uint8ToBase64(aadBytes) } : {}),
     };
 
     return {
@@ -503,8 +542,11 @@ export async function encryptPayloadAESGCM(data, secretKeyString = DEFAULT_MESH_
 
 /**
  * Decrypt an AES-256-GCM envelope and verify its GCM authentication tag.
+ * @param {string|object} envelopeInput - The encrypted envelope
+ * @param {string} secretKeyString - Mesh shared secret
+ * @param {Uint8Array|null} aadBytes - AAD bytes to verify against (reconstructed from packet header)
  */
-export async function decryptPayloadAESGCM(envelopeInput, secretKeyString = DEFAULT_MESH_SECRET) {
+export async function decryptPayloadAESGCM(envelopeInput, secretKeyString = DEFAULT_MESH_SECRET, aadBytes = null) {
   let envelope = envelopeInput;
 
   if (typeof envelopeInput === 'string') {
@@ -532,6 +574,9 @@ export async function decryptPayloadAESGCM(envelopeInput, secretKeyString = DEFA
   try {
     const iv = base64ToUint8(envelope.iv);
     const ciphertextBytes = base64ToUint8(envelope.ct);
+    // Resolve AAD: prefer caller-supplied, fall back to embedded envelope.aad
+    const resolvedAAD = aadBytes ||
+      (envelope.aad ? base64ToUint8(envelope.aad) : new Uint8Array(0));
     let decryptedBuffer = null;
 
     if (typeof globalThis !== 'undefined' && globalThis.crypto?.subtle) {
@@ -539,7 +584,7 @@ export async function decryptPayloadAESGCM(envelopeInput, secretKeyString = DEFA
         const key = await deriveMeshCryptoKey(secretKeyString);
         if (key instanceof CryptoKey) {
           decryptedBuffer = await globalThis.crypto.subtle.decrypt(
-            { name: 'AES-GCM', iv },
+            { name: 'AES-GCM', iv, additionalData: resolvedAAD.length > 0 ? resolvedAAD : undefined },
             key,
             ciphertextBytes
           );
@@ -552,7 +597,7 @@ export async function decryptPayloadAESGCM(envelopeInput, secretKeyString = DEFA
     if (!decryptedBuffer) {
       const encoder = new TextEncoder();
       const keyBytes = sha256JS(encoder.encode(secretKeyString));
-      decryptedBuffer = decryptAESGCM_JS(ciphertextBytes, keyBytes, iv);
+      decryptedBuffer = decryptAESGCM_JS(ciphertextBytes, keyBytes, iv, resolvedAAD);
     }
 
     const decoder = new TextDecoder();

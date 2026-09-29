@@ -410,13 +410,25 @@ async function runHQAuthTests() {
 
   // ────────────────────────────────────────────────────────────────
   // TEST 17: HQ Decryption
+  // [B1 Fix] Encryption MUST supply AAD matching the packet header fields,
+  // because processIncomingPacket reconstructs AAD from packet.id,
+  // sourceNodeId, destinationNodeId, type, ts for GCM tag verification.
   // ────────────────────────────────────────────────────────────────
   console.log('\n--- Test 17: HQ Decryption ---');
   await setNodeRole('HQ');
 
-  const hqTargetEnc = await encryptPayloadAESGCM({ message: 'URGENT SOS AT HQ DESTINATION' });
+  const hqTargetId = `hq_decrypt_test_${Date.now()}`;
+  const hqTargetTs = Date.now();
+  const hqTargetAAD = {
+    id: hqTargetId,
+    sourceNodeId: 'NODE-FIELD-SENDER',
+    destinationNodeId: HQ_NODE_ID,
+    type: 'SOS',
+    ts: hqTargetTs,
+  };
+  const hqTargetEnc = await encryptPayloadAESGCM({ message: 'URGENT SOS AT HQ DESTINATION' }, undefined, hqTargetAAD);
   const hqTargetPacket = {
-    id: `hq_decrypt_test_${Date.now()}`,
+    id: hqTargetId,
     sourceNodeId: 'NODE-FIELD-SENDER',
     destinationNodeId: HQ_NODE_ID,
     routeHistory: ['NODE-FIELD-SENDER', 'NODE-RELAY-MID'],
@@ -425,6 +437,7 @@ async function runHQAuthTests() {
     payload: hqTargetEnc.envelope,
     encrypted: true,
     type: 'SOS',
+    ts: hqTargetTs,
   };
 
   const hqDelivery = await processIncomingPacket(hqTargetPacket, 'Relay_Before_HQ');

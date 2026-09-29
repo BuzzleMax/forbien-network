@@ -1,0 +1,7 @@
+- [x] Fix HomeScreen.js — add Pressable to import list (critical crash fix)
+- [x] Fix meshLogic.js — BLE advertising name for HQ (ForBien-HQ-FORBIEN-HQ-01 → ForBien-HQ)
+- [x] Fix test-hq-functionality.js — add clearMockStorage(), import saveHQReceivedMessages/loadHQReceivedMessages
+- [x] Create test-hq-physical.js — full §12 test suite (HQ assignment, persistence, FIELD, RELAY, nodeID, destination, detection, stop-forward, emergency, timestamp, location, routing)
+- [x] Update package.json — add test:physical script
+- [x] Run all tests and verify pass counts
+- [x] Write final walkthrough report

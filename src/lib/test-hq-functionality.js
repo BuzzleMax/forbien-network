@@ -34,6 +34,8 @@ import {
 import {
   _TEST_overrideAuthorizedHQPublicKey,
   _TEST_resetAuthorizedHQPublicKey,
+  encryptPayloadAESGCM,
+  DEFAULT_MESH_SECRET,
 } from './crypto.js';
 
 // TEST KEYPAIR — safe to embed in source; NOT the deployment keypair.
@@ -138,13 +140,20 @@ async function runHQTests() {
   // ----------------------------------------------------
   console.log('\n--- Test 6: HQ Destination Detection ---');
   await setNodeRole('HQ'); // Set to HQ role for this test
+  const testPacketId = `test_hq_dest_${Date.now()}`;
+  const ts1 = Date.now();
+  const enc1 = await encryptPayloadAESGCM({ text: 'Test message for HQ' }, DEFAULT_MESH_SECRET, {
+    id: testPacketId, sourceNodeId: 'NODE-A123', destinationNodeId: 'FORBIEN-HQ-01', type: 'SOS', ts: ts1
+  });
   const testPacket = {
-    id: `test_hq_dest_${Date.now()}`,
+    id: testPacketId,
     sourceNodeId: 'NODE-A123',
     destinationNodeId: 'FORBIEN-HQ-01',
+    type: 'SOS',
+    ts: ts1,
     hopCount: 0,
     maxHops: 5,
-    payload: { text: 'Test message for HQ' },
+    payload: enc1.envelope,
   };
 
   const hqProcessResult = await processIncomingPacket(testPacket, 'Peer_X');
@@ -156,13 +165,20 @@ async function runHQTests() {
   // TEST 7: HQ Stopping Forwarding
   // ----------------------------------------------------
   console.log('\n--- Test 7: HQ Stopping Forwarding ---');
+  const hqStopPacketId = `test_hq_stop_${Date.now()}`;
+  const ts2 = Date.now();
+  const enc2 = await encryptPayloadAESGCM({ text: 'Test HQ stop forwarding' }, DEFAULT_MESH_SECRET, {
+    id: hqStopPacketId, sourceNodeId: 'NODE-B456', destinationNodeId: 'FORBIEN-HQ-01', type: 'SOS', ts: ts2
+  });
   const hqStopPacket = {
-    id: `test_hq_stop_${Date.now()}`,
+    id: hqStopPacketId,
     sourceNodeId: 'NODE-B456',
     destinationNodeId: 'FORBIEN-HQ-01',
+    type: 'SOS',
+    ts: ts2,
     hopCount: 2,
     maxHops: 5,
-    payload: { text: 'Test HQ stop forwarding' },
+    payload: enc2.envelope,
   };
 
   const hqStopResult = await processIncomingPacket(hqStopPacket, 'Peer_Y');

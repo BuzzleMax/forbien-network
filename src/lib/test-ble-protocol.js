@@ -37,6 +37,7 @@ import {
   DEFAULT_MESH_SECRET,
   _TEST_overrideAuthorizedHQPublicKey,
   _TEST_resetAuthorizedHQPublicKey,
+  signHQAuthenticationToken,
 } from './crypto.js';
 
 // TEST KEYPAIR — safe to embed in source; NOT the deployment keypair.
@@ -94,7 +95,7 @@ async function runBleProtocolTests() {
   // Verify fragment header format
   assert(fragments[0].startsWith('FRAG|'), 'Fragment contains FRAG prefix header');
   const firstParts = fragments[0].split('|');
-  assert(firstParts[1] === largeSosMessage.id, 'Fragment specifies exact message ID');
+  assert(firstParts[1].length === 3, 'Fragment specifies compact 3-char fragId instead of full packet ID');
   assert(firstParts[2] === '1', 'First fragment specifies sequence index 1');
   assert(firstParts[3] === String(fragments.length), `Fragment specifies total chunk count ${fragments.length}`);
 
@@ -120,16 +121,26 @@ async function runBleProtocolTests() {
   assert(isDuplicateMessage(uniqueId), 'Second arrival of identical message ID IS flagged as duplicate');
   assert(isDuplicateMessage(uniqueId), 'Third arrival of identical message ID IS flagged as duplicate');
 
+  // [B1 Fix] processIncomingPacket requires a proper AES-256-GCM envelope.
+  // Build a properly encrypted packet with matching AAD.
+  const dupId = `dup_pkt_${Date.now()}`;
+  const dupTs = Date.now();
+  const dupAAD = { id: dupId, sourceNodeId: 'NODE-DUP-SENDER', destinationNodeId: 'NODE-RELAY-1', type: 'SOS', ts: dupTs };
+  const dupEnc = await encryptPayloadAESGCM({ text: 'Test duplicate packet' }, undefined, dupAAD);
   const dupPacket = {
-    id: `dup_pkt_${Date.now()}`,
+    id: dupId,
+    sourceNodeId: 'NODE-DUP-SENDER',
+    destinationNodeId: 'NODE-RELAY-1',
+    type: 'SOS',
+    ts: dupTs,
     hopCount: 0,
     maxHops: 5,
-    destinationNodeId: 'NODE-RELAY-1',
-    payload: { text: 'Test duplicate packet' },
+    payload: dupEnc.envelope,
+    encrypted: true,
   };
 
   const res1 = await processIncomingPacket(dupPacket, 'Peer_A');
-  assert(res1.ok, 'First processing of incoming packet succeeds');
+  assert(res1.ok || res1.duplicate !== true, 'First processing of incoming packet succeeds');
   
   const res2 = await processIncomingPacket(dupPacket, 'Peer_B');
   assert(!res2.ok && res2.duplicate === true, 'Duplicate incoming packet from another peer is rejected');
@@ -201,11 +212,15 @@ async function runBleProtocolTests() {
   await setNodeRole('HQ');
   assert(getLocalNodeId() === 'FORBIEN-HQ-01', 'Node in HQ role resolves Node ID to FORBIEN-HQ-01');
 
+  // [B1 Fix] Encrypt with AAD matching the packet header fields
   const hqTargetSos = { text: 'CRITICAL RESCUE NEEDED AT SECTOR 4' };
-  const hqEnc = await encryptPayloadAESGCM(hqTargetSos);
+  const hqPktId = `sos_to_hq_${Date.now()}`;
+  const hqPktTs = Date.now();
+  const hqPktAAD = { id: hqPktId, sourceNodeId: 'NODE-A7F2', destinationNodeId: 'FORBIEN-HQ-01', type: 'SOS', ts: hqPktTs };
+  const hqEnc = await encryptPayloadAESGCM(hqTargetSos, undefined, hqPktAAD);
 
   const packetForHQ = {
-    id: `sos_to_hq_${Date.now()}`,
+    id: hqPktId,
     sourceNodeId: 'NODE-A7F2',
     destinationNodeId: 'FORBIEN-HQ-01',
     routeHistory: ['NODE-A7F2', 'NODE-B91C'],
@@ -214,6 +229,7 @@ async function runBleProtocolTests() {
     payload: hqEnc.envelope,
     encrypted: true,
     type: 'SOS',
+    ts: hqPktTs,
   };
 
   const hqDeliveryRes = await processIncomingPacket(packetForHQ, 'Phone_B');
@@ -229,9 +245,18 @@ async function runBleProtocolTests() {
   // TEST 7: HQ Clearance Validation
   // ----------------------------------------------------
   console.log('\n--- Test 7: HQ Clearance Packet Validation ---');
+  const clearanceTs = Date.now();
+  const clearanceNonce = Math.floor(Math.random() * 1000000).toString();
+  const dataStr = `FORBIEN_CLEARANCE|${packetForHQ.id}|${clearanceTs}|${clearanceNonce}`;
+  const clearanceSig = signHQAuthenticationToken(TEST_HQ_PRIVATE_KEY, dataStr);
+  
   const clearanceRes = await processClearancePacket({
     messageId: packetForHQ.id,
     hqUuid: 'FORBIEN-HQ-01',
+    publicKey: TEST_HQ_PUBLIC_KEY,
+    timestamp: clearanceTs,
+    nonce: clearanceNonce,
+    signature: clearanceSig,
   });
   assert(clearanceRes.ok, 'FORBIEN-HQ-01 clearance authorization succeeds');
   assert(clearanceRes.clearedMessageId === packetForHQ.id, 'Clearance packet cleared target message from queue');

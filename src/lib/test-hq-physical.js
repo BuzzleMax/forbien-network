@@ -265,13 +265,17 @@ async function runPhysicalHQTests() {
 
   await setNodeRole('HQ');
 
+  const incomingId1 = `hq_detect_${Date.now()}`;
+  const incomingTs1 = Date.now();
+  const incomingAAD1 = { id: incomingId1, sourceNodeId: 'NODE-A123', destinationNodeId: 'FORBIEN-HQ-01', type: 'SOS', ts: incomingTs1 };
   const enc = await encryptPayloadAESGCM(
     { text: 'Officer down at grid 7-Alpha, requesting immediate backup' },
     DEFAULT_MESH_SECRET,
+    incomingAAD1
   );
 
   const incomingPacket = {
-    id: `hq_detect_${Date.now()}`,
+    id: incomingId1,
     type: 'SOS',
     sourceNodeId: 'NODE-A123',
     destinationNodeId: 'FORBIEN-HQ-01',
@@ -280,7 +284,7 @@ async function runPhysicalHQTests() {
     maxHops: 5,
     payload: enc.envelope,
     encrypted: true,
-    ts: Date.now(),
+    ts: incomingTs1,
   };
 
   const detectResult = await processIncomingPacket(incomingPacket, 'Phone_B');
@@ -318,12 +322,16 @@ async function runPhysicalHQTests() {
   );
 
   // Explicitly test: a second DIFFERENT packet delivered to HQ must also halt
+  const incomingId2 = `hq_stop_fwd_${Date.now()}`;
+  const incomingTs2 = Date.now();
+  const incomingAAD2 = { id: incomingId2, sourceNodeId: 'NODE-C789', destinationNodeId: 'FORBIEN-HQ-01', type: 'SOS', ts: incomingTs2 };
   const enc2 = await encryptPayloadAESGCM(
     { text: 'Vehicle fire on highway 12' },
     DEFAULT_MESH_SECRET,
+    incomingAAD2
   );
   const secondPacket = {
-    id: `hq_stop_fwd_${Date.now()}`,
+    id: incomingId2,
     type: 'SOS',
     sourceNodeId: 'NODE-C789',
     destinationNodeId: 'FORBIEN-HQ-01',
@@ -332,7 +340,7 @@ async function runPhysicalHQTests() {
     maxHops: 5,
     payload: enc2.envelope,
     encrypted: true,
-    ts: Date.now(),
+    ts: incomingTs2,
   };
 
   const hqStopRes = await processIncomingPacket(secondPacket, 'Phone_C');
@@ -473,14 +481,18 @@ async function runPhysicalHQTests() {
   await setNodeRole('RELAY');
   const relayNodeId = getLocalNodeId();
 
+  const incomingId3 = `route_test_${Date.now()}`;
+  const incomingTs3 = Date.now();
+  const incomingAAD3 = { id: incomingId3, sourceNodeId: 'NODE-A111', destinationNodeId: 'FORBIEN-HQ-01', type: 'SOS', ts: incomingTs3 };
   const encRoute = await encryptPayloadAESGCM(
     { text: 'CRITICAL: Dam breach imminent' },
     DEFAULT_MESH_SECRET,
+    incomingAAD3
   );
 
   // Simulate: NODE-A → NODE-B (this relay) → FORBIEN-HQ-01
   const routePacket = {
-    id: `route_test_${Date.now()}`,
+    id: incomingId3,
     type: 'SOS',
     sourceNodeId: 'NODE-A111',
     destinationNodeId: 'FORBIEN-HQ-01',
@@ -489,7 +501,7 @@ async function runPhysicalHQTests() {
     maxHops: 5,
     payload: encRoute.envelope,
     encrypted: true,
-    ts: Date.now(),
+    ts: incomingTs3,
   };
 
   // This RELAY node processes the packet — it should relay it (not deliver)
@@ -519,9 +531,19 @@ async function runPhysicalHQTests() {
   };
 
   // Give it a new ID to avoid duplicate cache hit
+  // We must re-encrypt because the ID is part of the AES-GCM AAD
+  const hqBoundId = `route_hq_bound_${Date.now()}`;
+  const hqBoundAAD = { id: hqBoundId, sourceNodeId: relayedPacketForHQ.sourceNodeId, destinationNodeId: relayedPacketForHQ.destinationNodeId, type: relayedPacketForHQ.type, ts: relayedPacketForHQ.ts };
+  const hqBoundEnc = await encryptPayloadAESGCM(
+    { text: 'CRITICAL: Dam breach imminent' },
+    DEFAULT_MESH_SECRET,
+    hqBoundAAD
+  );
+
   const hqBoundPacket = {
     ...relayedPacketForHQ,
-    id: `route_hq_bound_${Date.now()}`,
+    id: hqBoundId,
+    payload: hqBoundEnc.envelope
   };
 
   const hqRouteResult = await processIncomingPacket(hqBoundPacket, 'Phone_B');
@@ -614,13 +636,23 @@ async function runPhysicalHQTests() {
   // ──────────────────────────────────────────────────────
   section('BONUS  TTL / Max Hops Enforcement');
 
+  const ttlId = `ttl_${Date.now()}`;
+  const ttlTs = Date.now();
+  const ttlEnc = await encryptPayloadAESGCM(
+    { text: 'TTL test' },
+    DEFAULT_MESH_SECRET,
+    { id: ttlId, sourceNodeId: 'NODE-TTL1', destinationNodeId: 'NODE-SOMEWHERE', type: 'SOS', ts: ttlTs }
+  );
   const ttlPkt = {
-    id: `ttl_${Date.now()}`,
+    id: ttlId,
+    type: 'SOS',
     hopCount: 5,
     maxHops: 5,
     sourceNodeId: 'NODE-TTL1',
     destinationNodeId: 'NODE-SOMEWHERE',
-    payload: { text: 'TTL test' },
+    payload: ttlEnc.envelope,
+    encrypted: true,
+    ts: ttlTs
   };
 
   const ttlRes = await processIncomingPacket(ttlPkt, 'Phone_X');

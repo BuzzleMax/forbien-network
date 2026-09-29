@@ -21,7 +21,14 @@ import {
   isLegacyXORPacket,
   handleLegacyXORPacket,
   DEFAULT_MESH_SECRET,
+  signHQAuthenticationToken,
+  _TEST_overrideAuthorizedHQPublicKey,
 } from './crypto.js';
+
+// TEST KEYPAIR — safe to embed in source; NOT the deployment keypair.
+const TEST_HQ_PRIVATE_KEY = 'b0f3ebe6f64286a79eb8f728dd1984e298f3bb0762ddb320b0c5ea544d6a8b94';
+const TEST_HQ_PUBLIC_KEY  = 'ddb24c10408a4897b7884d2d6e3e8affdc44040e05cd1370f9b38ff1efc6e6e6';
+_TEST_overrideAuthorizedHQPublicKey(TEST_HQ_PUBLIC_KEY);
 
 import {
   compressSOSData,
@@ -174,12 +181,19 @@ async function runTestSuite() {
   storeMessagePersistent({ id: testMessageId, text: 'SOS message to clear' });
 
   // Create clear packet signed by authorized HQ
-  const hqUuid = 'hq-command-primary-001';
+  const hqUuid = 'FORBIEN-HQ-01';
+  const clearanceTs = Date.now();
+  const clearanceNonce = Math.floor(Math.random() * 1000000).toString();
+  const dataStr = `FORBIEN_CLEARANCE|${testMessageId}|${clearanceTs}|${clearanceNonce}`;
+  const clearanceSig = signHQAuthenticationToken(TEST_HQ_PRIVATE_KEY, dataStr);
+
   const clearancePayload = {
     messageId: testMessageId,
     hqUuid,
-    signature: 'mock_valid_signature_123',
-    timestamp: Date.now(),
+    publicKey: TEST_HQ_PUBLIC_KEY,
+    signature: clearanceSig,
+    timestamp: clearanceTs,
+    nonce: clearanceNonce,
   };
 
   // Encrypt HQ clearance packet with AES-256-GCM

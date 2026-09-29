@@ -71,18 +71,18 @@ public class BleGattServerModule extends ReactContextBaseJavaModule {
     public void isPeripheralSupported(Promise promise) {
         try {
             BluetoothManager manager = (BluetoothManager) reactContext.getSystemService(Context.BLUETOOTH_SERVICE);
-            if (manager == null) {
-                promise.resolve(false);
-                return;
-            }
-            BluetoothAdapter adapter = manager.getAdapter();
-            if (adapter == null || !adapter.isEnabled()) {
-                promise.resolve(false);
-                return;
-            }
-            boolean supported = adapter.isMultipleAdvertisementSupported();
+            boolean managerAvailable = manager != null;
+            BluetoothAdapter adapter = managerAvailable ? manager.getAdapter() : null;
+            boolean adapterAvailable = adapter != null;
+            boolean bluetoothEnabled = adapterAvailable && adapter.isEnabled();
+            boolean multiAdv = adapterAvailable && adapter.isMultipleAdvertisementSupported();
+            boolean advertiserAvailable = adapterAvailable && adapter.getBluetoothLeAdvertiser() != null;
+            boolean supported = multiAdv || advertiserAvailable;
+
+            Log.d(TAG, "[FORBIEN_BLE]\nadapter available = " + adapterAvailable + "\nbluetooth enabled = " + bluetoothEnabled + "\nperipheral supported = " + supported);
             promise.resolve(supported);
         } catch (Exception e) {
+            Log.e(TAG, "[FORBIEN_BLE] Error checking peripheral support", e);
             promise.resolve(false);
         }
     }
@@ -91,25 +91,27 @@ public class BleGattServerModule extends ReactContextBaseJavaModule {
     public void startGattServer(Promise promise) {
         try {
             bluetoothManager = (BluetoothManager) reactContext.getSystemService(Context.BLUETOOTH_SERVICE);
+            Log.d(TAG, "[BLE_GATT_SERVER_AUDIT] BluetoothManager available: " + (bluetoothManager != null));
             if (bluetoothManager == null) {
                 promise.reject("ERR_BT", "BluetoothManager not available");
                 return;
             }
             bluetoothAdapter = bluetoothManager.getAdapter();
+            Log.d(TAG, "[BLE_GATT_SERVER_AUDIT] BluetoothAdapter available: " + (bluetoothAdapter != null) + ", enabled: " + (bluetoothAdapter != null && bluetoothAdapter.isEnabled()));
             if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled()) {
                 promise.reject("ERR_BT_OFF", "Bluetooth adapter is off or unavailable");
                 return;
             }
-            // Log adapter state
-            Log.d(TAG, "Bluetooth Adapter state: " + (bluetoothAdapter.isEnabled() ? "ENABLED" : "DISABLED"));
 
             if (gattServer != null) {
+                Log.d(TAG, "[BLE_GATT_SERVER_AUDIT] Closing existing GATT Server instance");
                 gattServer.close();
                 gattServer = null;
             }
 
             gattServer = bluetoothManager.openGattServer(reactContext, gattServerCallback);
             if (gattServer == null) {
+                Log.e(TAG, "[BLE_GATT_SERVER_AUDIT] openGattServer returned NULL");
                 promise.reject("ERR_GATT_SERVER", "Could not open GATT Server");
                 return;
             }
@@ -129,13 +131,14 @@ public class BleGattServerModule extends ReactContextBaseJavaModule {
             boolean added = gattServer.addService(service);
 
             if (added) {
-                Log.d(TAG, "GATT Server started and service added successfully");
+                Log.d(TAG, "[BLE_GATT_SERVER_AUDIT] GATT Server started & primary service 128-bit UUID added: " + SERVICE_UUID);
                 promise.resolve(true);
             } else {
+                Log.e(TAG, "[BLE_GATT_SERVER_AUDIT] Failed to add GATT Service 128-bit UUID: " + SERVICE_UUID);
                 promise.reject("ERR_ADD_SERVICE", "Failed to add GATT Service");
             }
         } catch (Exception e) {
-            Log.e(TAG, "Error starting GATT Server", e);
+            Log.e(TAG, "[BLE_GATT_SERVER_AUDIT] Error starting GATT Server", e);
             promise.reject("ERR_START_GATT", e.getMessage());
         }
     }
@@ -143,6 +146,7 @@ public class BleGattServerModule extends ReactContextBaseJavaModule {
     @ReactMethod
     public void startAdvertising(String localName, Promise promise) {
         try {
+            Log.d(TAG, "[FORBIEN_ADV_START]");
             if (bluetoothAdapter == null) {
                 bluetoothManager = (BluetoothManager) reactContext.getSystemService(Context.BLUETOOTH_SERVICE);
                 if (bluetoothManager != null) {
@@ -151,13 +155,17 @@ public class BleGattServerModule extends ReactContextBaseJavaModule {
             }
 
             if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled()) {
-                promise.reject("ERR_BT_OFF", "Bluetooth is disabled");
+                String errorMsg = "Bluetooth is disabled or adapter is null";
+                Log.e(TAG, "[FORBIEN_ADV_FAILURE]\nerrorCode = -1\nhumanReadableError = " + errorMsg);
+                promise.reject("ERR_BT_OFF", errorMsg);
                 return;
             }
 
             advertiser = bluetoothAdapter.getBluetoothLeAdvertiser();
             if (advertiser == null) {
-                promise.reject("ERR_NO_ADVERTISER", "BLE Advertising not supported on this device");
+                String errorMsg = "BLE Advertiser instance is NULL - device does not support BLE Peripheral advertising";
+                Log.e(TAG, "[FORBIEN_ADV_FAILURE]\nerrorCode = -2\nhumanReadableError = " + errorMsg);
+                promise.reject("ERR_NO_ADVERTISER", errorMsg);
                 return;
             }
 
@@ -170,8 +178,11 @@ public class BleGattServerModule extends ReactContextBaseJavaModule {
 
             ParcelUuid pUuid = new ParcelUuid(UUID.fromString(SERVICE_UUID));
 
+            // Primary payload includes Service UUID; device name kept in ScanResponse for payload budget
             AdvertiseData data = new AdvertiseData.Builder()
                     .addServiceUuid(pUuid)
+                    .setIncludeDeviceName(false)
+                    .setIncludeTxPowerLevel(false)
                     .build();
 
             AdvertiseData scanResponse = new AdvertiseData.Builder()
@@ -188,16 +199,38 @@ public class BleGattServerModule extends ReactContextBaseJavaModule {
                 @Override
                 public void onStartSuccess(AdvertiseSettings settingsInEffect) {
                     super.onStartSuccess(settingsInEffect);
-                    Log.d(TAG, "BLE Advertising started successfully");
+                    Log.d(TAG, "[FORBIEN_ADV_SUCCESS]");
                     sendEvent("onBleAdvertisingStarted", null);
                 }
 
                 @Override
                 public void onStartFailure(int errorCode) {
                     super.onStartFailure(errorCode);
-                    Log.e(TAG, "BLE Advertising failed with error code: " + errorCode);
+                    String interpretation;
+                    switch (errorCode) {
+                        case AdvertiseCallback.ADVERTISE_FAILED_DATA_TOO_LARGE:
+                            interpretation = "ADVERTISE_FAILED_DATA_TOO_LARGE (1): Data packet exceeds 31 bytes limit";
+                            break;
+                        case AdvertiseCallback.ADVERTISE_FAILED_TOO_MANY_ADVERTISERS:
+                            interpretation = "ADVERTISE_FAILED_TOO_MANY_ADVERTISERS (2): No advertising instances available";
+                            break;
+                        case AdvertiseCallback.ADVERTISE_FAILED_ALREADY_STARTED:
+                            interpretation = "ADVERTISE_FAILED_ALREADY_STARTED (3): Advertising already started";
+                            break;
+                        case AdvertiseCallback.ADVERTISE_FAILED_INTERNAL_ERROR:
+                            interpretation = "ADVERTISE_FAILED_INTERNAL_ERROR (4): Operation failed due to internal error";
+                            break;
+                        case AdvertiseCallback.ADVERTISE_FAILED_FEATURE_UNSUPPORTED:
+                            interpretation = "ADVERTISE_FAILED_FEATURE_UNSUPPORTED (5): Peripheral advertising unsupported";
+                            break;
+                        default:
+                            interpretation = "ADVERTISE_FAILED_UNKNOWN (" + errorCode + ")";
+                            break;
+                    }
+                    Log.e(TAG, "[FORBIEN_ADV_FAILURE]\nerrorCode = " + errorCode + "\nhumanReadableError = " + interpretation);
                     WritableMap params = Arguments.createMap();
                     params.putInt("errorCode", errorCode);
+                    params.putString("reason", interpretation);
                     sendEvent("onBleAdvertisingFailed", params);
                 }
             };
@@ -206,14 +239,14 @@ public class BleGattServerModule extends ReactContextBaseJavaModule {
                 try {
                     bluetoothAdapter.setName(localName);
                 } catch (Exception e) {
-                    Log.w(TAG, "Could not set Bluetooth local name: " + e.getMessage());
+                    Log.w(TAG, "[BLE_ADVERTISE_AUDIT] Could not set Bluetooth local name: " + e.getMessage());
                 }
             }
 
             advertiser.startAdvertising(settings, data, scanResponse, advertiseCallback);
             promise.resolve(true);
         } catch (Exception e) {
-            Log.e(TAG, "Failed to start BLE advertising", e);
+            Log.e(TAG, "[FORBIEN_ADV_FAILURE]\nerrorCode = -99\nhumanReadableError = " + e.getMessage(), e);
             promise.reject("ERR_ADVERTISE", e.getMessage());
         }
     }
@@ -250,16 +283,18 @@ public class BleGattServerModule extends ReactContextBaseJavaModule {
         public void onConnectionStateChange(BluetoothDevice device, int status, int newState) {
             super.onConnectionStateChange(device, status, newState);
             WritableMap params = Arguments.createMap();
-            params.putString("deviceId", device.getAddress());
-            params.putString("deviceName", device.getName() != null ? device.getName() : "Unknown");
+            String devId = device.getAddress();
+            String devName = device.getName() != null ? device.getName() : "Unknown";
+            params.putString("deviceId", devId);
+            params.putString("deviceName", devName);
             params.putInt("status", status);
             params.putInt("newState", newState);
 
             if (newState == BluetoothProfile.STATE_CONNECTED) {
-                Log.d(TAG, "BLE Central connected to our GATT Server: " + device.getAddress());
+                Log.d(TAG, "[FORBIEN_CONNECT_SUCCESS]\ndeviceId = " + devId);
                 sendEvent("onBleCentralConnected", params);
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                Log.d(TAG, "BLE Central disconnected from GATT Server: " + device.getAddress());
+                Log.d(TAG, "[FORBIEN_CONNECT_FAILURE]\ndeviceId = " + devId + "\nerror = Central Disconnected\nerrorCode = " + status);
                 sendEvent("onBleCentralDisconnected", params);
             }
         }
@@ -273,6 +308,21 @@ public class BleGattServerModule extends ReactContextBaseJavaModule {
             }
 
             if (value != null && value.length > 0) {
+                String rawStr = new String(value, StandardCharsets.UTF_8);
+                if (rawStr.trim().equals("FORBIEN_PING")) {
+                    Log.d(TAG, "[FORBIEN_PING_RECEIVED]\nfrom = " + device.getAddress());
+                    WritableMap pingParams = Arguments.createMap();
+                    pingParams.putString("deviceId", device.getAddress());
+                    pingParams.putString("deviceName", device.getName() != null ? device.getName() : "Unknown");
+                    pingParams.putString("dataBase64", Base64.encodeToString("FORBIEN_PONG".getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP));
+                    pingParams.putString("type", "PONG");
+                    sendEvent("onBleCharacteristicWrite", pingParams);
+                    return;
+                }
+                if (rawStr.trim().equals("FORBIEN_PONG")) {
+                    Log.d(TAG, "[FORBIEN_PONG_RECEIVED]\nfrom = " + device.getAddress());
+                }
+
                 String base64Data = Base64.encodeToString(value, Base64.NO_WRAP);
                 WritableMap params = Arguments.createMap();
                 params.putString("deviceId", device.getAddress());
@@ -287,7 +337,7 @@ public class BleGattServerModule extends ReactContextBaseJavaModule {
         public void onCharacteristicReadRequest(BluetoothDevice device, int requestId, int offset, BluetoothGattCharacteristic characteristic) {
             super.onCharacteristicReadRequest(device, requestId, offset, characteristic);
             if (gattServer != null) {
-                byte[] responseValue = "FORBIEN_MESH_NODE".getBytes();
+                byte[] responseValue = "FORBIEN_MESH_NODE".getBytes(StandardCharsets.UTF_8);
                 gattServer.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, responseValue);
             }
         }
@@ -424,6 +474,7 @@ public class BleGattServerModule extends ReactContextBaseJavaModule {
         try {
             Activity activity = getCurrentActivity();
             if (activity == null) {
+                Log.e(TAG, "[FORBIEN_PERMISSIONS]\nBLUETOOTH_SCAN = false\nBLUETOOTH_CONNECT = false\nBLUETOOTH_ADVERTISE = false\nACCESS_FINE_LOCATION = false");
                 promise.resolve(null);
                 return;
             }
@@ -431,13 +482,21 @@ public class BleGattServerModule extends ReactContextBaseJavaModule {
             int connect = ContextCompat.checkSelfPermission(activity, android.Manifest.permission.BLUETOOTH_CONNECT);
             int advertise = ContextCompat.checkSelfPermission(activity, android.Manifest.permission.BLUETOOTH_ADVERTISE);
             int fineLoc = ContextCompat.checkSelfPermission(activity, android.Manifest.permission.ACCESS_FINE_LOCATION);
+            boolean scanOk = scan == android.content.pm.PackageManager.PERMISSION_GRANTED;
+            boolean connectOk = connect == android.content.pm.PackageManager.PERMISSION_GRANTED;
+            boolean advertiseOk = advertise == android.content.pm.PackageManager.PERMISSION_GRANTED;
+            boolean fineLocOk = fineLoc == android.content.pm.PackageManager.PERMISSION_GRANTED;
+
+            Log.d(TAG, "[FORBIEN_PERMISSIONS]\nBLUETOOTH_SCAN = " + scanOk + "\nBLUETOOTH_CONNECT = " + connectOk + "\nBLUETOOTH_ADVERTISE = " + advertiseOk + "\nACCESS_FINE_LOCATION = " + fineLocOk);
+
             WritableMap map = Arguments.createMap();
-            map.putBoolean("BLUETOOTH_SCAN", scan == android.content.pm.PackageManager.PERMISSION_GRANTED);
-            map.putBoolean("BLUETOOTH_CONNECT", connect == android.content.pm.PackageManager.PERMISSION_GRANTED);
-            map.putBoolean("BLUETOOTH_ADVERTISE", advertise == android.content.pm.PackageManager.PERMISSION_GRANTED);
-            map.putBoolean("ACCESS_FINE_LOCATION", fineLoc == android.content.pm.PackageManager.PERMISSION_GRANTED);
+            map.putBoolean("BLUETOOTH_SCAN", scanOk);
+            map.putBoolean("BLUETOOTH_CONNECT", connectOk);
+            map.putBoolean("BLUETOOTH_ADVERTISE", advertiseOk);
+            map.putBoolean("ACCESS_FINE_LOCATION", fineLocOk);
             promise.resolve(map);
         } catch (Exception e) {
+            Log.e(TAG, "[FORBIEN_PERMISSIONS] Exception checking permissions", e);
             promise.reject("ERR_PERM", e.getMessage());
         }
     }

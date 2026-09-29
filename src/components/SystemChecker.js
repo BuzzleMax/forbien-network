@@ -12,7 +12,7 @@ import {
 } from 'react-native';
 import * as Location from 'expo-location';
 import * as Network from 'expo-network';
-import { BleManager } from 'react-native-ble-plx';
+import { initBleManager } from '../api/meshLogic';
 import { colors } from '../theme/colors';
 
 const BT_REQUIRED_MESSAGE = 'Bluetooth Hardware Required for Mesh Network.';
@@ -129,15 +129,17 @@ export function SystemChecker({ onComplete }) {
 
   useEffect(() => {
     try {
-      managerRef.current = new BleManager();
-      btSubscriptionRef.current = managerRef.current.onStateChange(
-        (state) => {
-          const poweredOn = state === 'PoweredOn';
-          setBtOk(poweredOn);
-          setBtMessage(poweredOn ? 'Ready' : BT_REQUIRED_MESSAGE);
-        },
-        true,
-      );
+      managerRef.current = initBleManager();
+      if (managerRef.current && typeof managerRef.current.onStateChange === 'function') {
+        btSubscriptionRef.current = managerRef.current.onStateChange(
+          (state) => {
+            const poweredOn = state === 'PoweredOn';
+            setBtOk(poweredOn);
+            setBtMessage(poweredOn ? 'Ready' : BT_REQUIRED_MESSAGE);
+          },
+          true,
+        );
+      }
       syncBluetoothStatus();
     } catch {
       enableSimulatedBluetoothMode();
@@ -153,7 +155,6 @@ export function SystemChecker({ onComplete }) {
       sub.remove();
       btSubscriptionRef.current?.remove();
       btSubscriptionRef.current = null;
-      managerRef.current?.destroy();
       managerRef.current = null;
     };
   }, [enableSimulatedBluetoothMode, refresh, syncBluetoothStatus]);
